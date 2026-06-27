@@ -1,0 +1,58 @@
+name: cci
+
+services:
+  cci-blackbook:
+    build:
+      context: .
+      args:
+        CCI_INSTALL_ONNXRUNTIME_OPENVINO: "true"
+    image: cci-blackbook-mcp:local
+    container_name: cci-blackbook
+    restart: unless-stopped
+    env_file:
+      - ./secrets/cci.env
+    environment:
+      CCI_SOURCE_PDF: /data/source/CCI Black Book.pdf
+      CCI_INDEX_DIR: /data/index
+      CCI_CACHE_DIR: /data/cache
+      CCI_EMBEDDING_BACKEND: auto
+      CCI_EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
+      CCI_OPENVINO_DEVICE: GPU
+      CCI_RENDER_DEVICE: /dev/dri/renderD129
+      CCI_MCP_HOST: 0.0.0.0
+      CCI_MCP_PORT: "8000"
+      CCI_MIN_VECTOR_SCORE: "0.20"
+      CCI_EMBEDDING_BATCH_SIZE: "8"
+    expose:
+      - "8000"
+    devices:
+      - /dev/dri/renderD129:/dev/dri/renderD129
+    group_add:
+      - "993"
+    volumes:
+      - /mnt/data/cci-blackbook/source:/data/source:ro
+      - /mnt/data/cci-blackbook/index:/data/index
+      - /mnt/data/cci-blackbook/cache:/data/cache
+    labels:
+      - "pangolin.proxy-resources.cci-blackbook.name=CCI Black Book MCP"
+      - "pangolin.proxy-resources.cci-blackbook.protocol=http"
+      - "pangolin.proxy-resources.cci-blackbook.full-domain=cci.ai.${DOMAIN}"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].enabled=true"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].method=http"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].port=8000"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.hostname=cci-blackbook"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.port=8000"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.path=/healthz"
+      - "pangolin.proxy-resources.cci-blackbook.auth.sso-enabled=false"
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  proxy:
+    external: true
