@@ -31,13 +31,22 @@ def ask_blackbook(
 
 @mcp.tool
 def blackbook_search(query: str, limit: int = 10, mode: str = "hybrid") -> dict:
-    """Search the CCI Black Book with fts, vector, or hybrid retrieval."""
+    """Search the CCI Black Book.
+
+    mode: "hybrid" (BM25 + text-dense + image-dense, RRF-fused; default), "vector"
+    (both dense spaces), "fts", "text" (text-dense only), or "image" (page-image
+    dense only). Results include text chunks (unit_type="text") and scanned
+    figure/page images (unit_type="image").
+    """
     return service.search(query, limit=limit, mode=mode)
 
 
 @mcp.tool
 def blackbook_read_citation(chunk_id: str) -> dict:
-    """Read one bounded citation chunk by chunk_id."""
+    """Read one bounded citation unit by id.
+
+    Accepts a text chunk id ("p0042-c001") or a page-image unit id ("p0042-img").
+    """
     return service.read_citation(chunk_id)
 
 
@@ -59,6 +68,7 @@ async def healthz(_request):
             "source_exists": status["source"]["exists"],
             "index_ready": status["index"].get("ready", False),
             "auth_configured": auth_configured,
+            "voyage_configured": status.get("voyage_configured", False),
         },
         status_code=200 if healthy else 503,
     )
