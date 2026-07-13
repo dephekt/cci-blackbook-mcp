@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from math import ceil
 
 
 @dataclass(frozen=True)
@@ -114,3 +115,52 @@ def _advance_to_word_boundary(text: str, cursor: int) -> int:
     while cursor < len(text) and text[cursor].isspace():
         cursor += 1
     return cursor
+
+
+def estimate_tokens(text: str, chars_per_token: float) -> int:
+    return max(1, ceil(len(text) / chars_per_token))
+
+
+def group_chunks_into_documents(
+    chunks: list[Chunk],
+    *,
+    token_budget: int,
+    chars_per_token: float,
+    max_chunk_tokens: int,
+) -> list[list[int]]:
+    """Page-aligned greedy packing of chunk INDICES into documents <= token_budget.
+
+    A page's chunks are never split across documents (contextualization stays
+    within a page's neighborhood at minimum), every chunk lands in exactly one
+    document, and order is preserved so returned indices zip back to chunk_ids
+    positionally. Raises if any single chunk exceeds max_chunk_tokens.
+    """
+    if not chunks:
+        return []
+
+    # Collapse into per-page groups (chunk_pages emits a page's chunks contiguously).
+    pages: list[list] = []  # [page, [indices], token_sum]
+    for idx, chunk in enumerate(chunks):
+        tok = estimate_tokens(chunk.text, chars_per_token)
+        if tok > max_chunk_tokens:
+            raise ValueError(
+                f"chunk {chunk.chunk_id} is ~{tok} tokens, exceeds max_chunk_tokens {max_chunk_tokens}"
+            )
+        if pages and pages[-1][0] == chunk.page:
+            pages[-1][1].append(idx)
+            pages[-1][2] += tok
+        else:
+            pages.append([chunk.page, [idx], tok])
+
+    documents: list[list[int]] = []
+    current: list[int] = []
+    current_tokens = 0
+    for _page, indices, page_tokens in pages:
+        if current and current_tokens + page_tokens > token_budget:
+            documents.append(current)
+            current, current_tokens = [], 0
+        current.extend(indices)
+        current_tokens += page_tokens
+    if current:
+        documents.append(current)
+    return documents
