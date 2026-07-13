@@ -131,7 +131,10 @@ def load_settings() -> Settings:
         voyage_timeout=_float_from_env("CCI_VOYAGE_TIMEOUT", 60.0),
         voyage_max_retries=_int_from_env("CCI_VOYAGE_MAX_RETRIES", 4),
         voyage_retention_confirmed=_bool_from_env("CCI_VOYAGE_RETENTION_CONFIRMED", False),
-        doc_token_budget=_int_from_env("CCI_DOC_TOKEN_BUDGET", 100000),
+        # voyage-context-4 rejects a single example (document) whose chunks sum to
+        # > 32000 tokens (manual-chunking mode has no truncation); keep well under it.
+        # Our token estimate over-counts vs the real tokenizer, so this is conservative.
+        doc_token_budget=_int_from_env("CCI_DOC_TOKEN_BUDGET", 28000),
         chars_per_token=_float_from_env("CCI_CHARS_PER_TOKEN", 3.0),
         max_chunk_tokens=_int_from_env("CCI_MAX_CHUNK_TOKENS", 32000),
         mm_token_budget=_int_from_env("CCI_MM_TOKEN_BUDGET", 200000),

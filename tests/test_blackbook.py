@@ -60,7 +60,7 @@ def make_settings(root: Path, **over) -> Settings:
         voyage_timeout=5.0,
         voyage_max_retries=0,
         voyage_retention_confirmed=True,
-        doc_token_budget=100000,
+        doc_token_budget=28000,
         chars_per_token=3.0,
         max_chunk_tokens=32000,
         mm_token_budget=200000,
@@ -707,6 +707,22 @@ class OfflineGuaranteeTest(unittest.TestCase):
             settings = make_settings(Path(d), embedding_backend="hash")
             with self.assertRaises(ValueError):
                 build_dense_provider(settings)
+
+
+class SettingsDefaultsTest(unittest.TestCase):
+    def test_default_doc_budget_fits_context4_example_limit(self):
+        # voyage-context-4 rejects a single example (document) whose chunks sum to
+        # > 32000 tokens. The production default must leave margin under that.
+        import os
+
+        from cci_blackbook.settings import load_settings
+
+        old = os.environ.pop("CCI_DOC_TOKEN_BUDGET", None)
+        try:
+            self.assertLess(load_settings().doc_token_budget, 32000)
+        finally:
+            if old is not None:
+                os.environ["CCI_DOC_TOKEN_BUDGET"] = old
 
 
 if __name__ == "__main__":
