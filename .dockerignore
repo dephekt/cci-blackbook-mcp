@@ -1,0 +1,10 @@
+# The Dockerfile only COPYs pyproject.toml, uv.lock, and app/cci_blackbook; keep the
+# build context (sent over the ssh docker context) small and free of secrets.
+.venv/
+**/__pycache__/
+*.pyc
+.ruff_cache/
+secrets/
+tests/
+PLAN-dual-embeddings.md
+README.md
