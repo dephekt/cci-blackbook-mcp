@@ -15,13 +15,30 @@ services:
       CCI_SOURCE_PDF: /data/source/CCI Black Book.pdf
       CCI_INDEX_DIR: /data/index
       CCI_CACHE_DIR: /data/cache
-      CCI_EMBEDDING_BACKEND: auto
+      # Dual Voyage index: context-4 over OCR text chunks + multimodal-3.5 over page
+      # renders, RRF-fused with FTS. VOYAGE_API_KEY + CCI_VOYAGE_RETENTION_CONFIRMED
+      # come from ./secrets/cci.env (see README). Needs outbound HTTPS to api.voyageai.com.
+      CCI_EMBEDDING_BACKEND: voyage
+      CCI_VOYAGE_TEXT_MODEL: voyage-context-4
+      CCI_VOYAGE_IMAGE_MODEL: voyage-multimodal-3.5
+      CCI_VOYAGE_OUTPUT_DIM: "1024"
+      CCI_RENDER_DPI: "100"
+      CCI_DOC_TOKEN_BUDGET: "100000"
+      CCI_MM_TOKEN_BUDGET: "200000"
+      CCI_MIN_VECTOR_SCORE: "0.20"
+      CCI_MIN_IMAGE_SCORE: "0.0"
+      CCI_RRF_WEIGHT_IMAGE: "2.0"
+      CCI_MAX_UNITS_PER_PAGE: "2"
+      CCI_BLANK_MIN_CHARS: "100"
+      CCI_BLANK_MAX_INK: "0.02"
+      CCI_BLANK_MAX_COLOR: "0.005"
+      CCI_MCP_HOST: 0.0.0.0
+      CCI_MCP_PORT: "8000"
+      # legacy FastEmbed/OpenVINO knobs — unused by the voyage backend; the GPU
+      # device mounts below are harmless and removed in the deferred follow-up.
       CCI_EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
       CCI_OPENVINO_DEVICE: GPU
       CCI_RENDER_DEVICE: /dev/dri/renderD129
-      CCI_MCP_HOST: 0.0.0.0
-      CCI_MCP_PORT: "8000"
-      CCI_MIN_VECTOR_SCORE: "0.20"
       CCI_EMBEDDING_BATCH_SIZE: "8"
     expose:
       - "8000"

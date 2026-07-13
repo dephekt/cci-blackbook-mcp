@@ -1,5 +1,10 @@
 FROM ghcr.io/astral-sh/uv:0.9.21 AS uv
 
+# The dual-index backend embeds via Voyage's HTTP API (api.voyageai.com); the
+# container needs outbound HTTPS at ingest and query time. PyMuPDF/Pillow ship
+# self-contained manylinux wheels, so no poppler/system PDF deps are needed.
+# The Intel-GPU/OpenVINO layers below are legacy (FastEmbed fallback) and are
+# removed atomically in the deferred GPU-stack follow-up.
 FROM ubuntu:24.04
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
