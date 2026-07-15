@@ -1,4 +1,12 @@
-name: cci
+# Base service definition.
+#
+#   docker compose up -d --build
+#       -> also loads docker-compose.override.yml (local: publishes 127.0.0.1:8000
+#          and mounts ./data), so it "just works" on your machine.
+#
+#   docker compose -f docker-compose.yml -f deploy/pangolin.yml up -d --build
+#       -> reverse-proxy deployment (no published host port; proxy fronts :8000).
+name: cci-blackbook
 
 services:
   cci-blackbook:
@@ -8,15 +16,17 @@ services:
     container_name: cci-blackbook
     restart: unless-stopped
     env_file:
-      - ./secrets/cci.env
+      # Copy secrets/cci.env.example -> secrets/cci.env. Optional so the stack can
+      # start from the defaults below (e.g. stub backend) before you create it.
+      - path: ./secrets/cci.env
+        required: false
     environment:
-      CCI_SOURCE_PDF: /data/source/CCI Black Book.pdf
+      CCI_SOURCE_PDF: /data/source/document.pdf
       CCI_INDEX_DIR: /data/index
       CCI_CACHE_DIR: /data/cache
-      # Dual Voyage index: context-4 over OCR text chunks + multimodal-3.5 over page
-      # renders, RRF-fused with FTS. VOYAGE_API_KEY + CCI_VOYAGE_RETENTION_CONFIRMED
-      # come from ./secrets/cci.env (see README). Needs outbound HTTPS to api.voyageai.com.
-      CCI_EMBEDDING_BACKEND: voyage
+      # "voyage" = real retrieval quality (needs VOYAGE_API_KEY); "stub" = offline
+      # hash embeddings, no key required — handy for a quick local smoke test.
+      CCI_EMBEDDING_BACKEND: ${CCI_EMBEDDING_BACKEND:-voyage}
       CCI_VOYAGE_TEXT_MODEL: voyage-context-4
       CCI_VOYAGE_IMAGE_MODEL: voyage-multimodal-3.5
       CCI_VOYAGE_OUTPUT_DIM: "1024"
@@ -34,30 +44,9 @@ services:
       CCI_MCP_PORT: "8000"
     expose:
       - "8000"
-    volumes:
-      - /mnt/data/cci-blackbook/source:/data/source:ro
-      - /mnt/data/cci-blackbook/index:/data/index
-      - /mnt/data/cci-blackbook/cache:/data/cache
-    labels:
-      - "pangolin.proxy-resources.cci-blackbook.name=CCI Black Book MCP"
-      - "pangolin.proxy-resources.cci-blackbook.protocol=http"
-      - "pangolin.proxy-resources.cci-blackbook.full-domain=cci.ai.${DOMAIN}"
-      - "pangolin.proxy-resources.cci-blackbook.targets[0].enabled=true"
-      - "pangolin.proxy-resources.cci-blackbook.targets[0].method=http"
-      - "pangolin.proxy-resources.cci-blackbook.targets[0].port=8000"
-      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.hostname=cci-blackbook"
-      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.port=8000"
-      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.path=/healthz"
-      - "pangolin.proxy-resources.cci-blackbook.auth.sso-enabled=false"
-    networks:
-      - proxy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 30s
-
-networks:
-  proxy:
-    external: true

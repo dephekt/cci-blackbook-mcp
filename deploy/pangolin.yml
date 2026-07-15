@@ -1,0 +1,29 @@
+# Optional overlay for a reverse-proxy deployment (Pangolin/Newt shown here).
+#
+#   DOMAIN=example.com docker compose -f docker-compose.yml -f deploy/pangolin.yml up -d --build
+#
+# The proxy fronts the container's exposed :8000; no host port is published.
+# Override CCI_DATA_DIR to point at wherever the PDF/index live on the host.
+services:
+  cci-blackbook:
+    volumes:
+      - ${CCI_DATA_DIR:-/mnt/data/cci-blackbook}/source:/data/source:ro
+      - ${CCI_DATA_DIR:-/mnt/data/cci-blackbook}/index:/data/index
+      - ${CCI_DATA_DIR:-/mnt/data/cci-blackbook}/cache:/data/cache
+    networks:
+      - proxy
+    labels:
+      - "pangolin.proxy-resources.cci-blackbook.name=CCI Black Book MCP"
+      - "pangolin.proxy-resources.cci-blackbook.protocol=http"
+      - "pangolin.proxy-resources.cci-blackbook.full-domain=cci.ai.${DOMAIN}"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].enabled=true"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].method=http"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].port=8000"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.hostname=cci-blackbook"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.port=8000"
+      - "pangolin.proxy-resources.cci-blackbook.targets[0].healthcheck.path=/healthz"
+      - "pangolin.proxy-resources.cci-blackbook.auth.sso-enabled=false"
+
+networks:
+  proxy:
+    external: true

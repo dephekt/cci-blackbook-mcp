@@ -1,0 +1,13 @@
+# Local data (PDF, index, cache) and real secrets — never commit.
+/data/
+/secrets/*.env
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# SQLite index artifacts
+*.sqlite3
+*.sqlite3-*

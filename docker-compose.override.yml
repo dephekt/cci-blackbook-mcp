@@ -1,0 +1,10 @@
+# Local development defaults — auto-loaded by `docker compose up`.
+# Publishes the MCP on localhost only and serves the PDF/index from ./data.
+services:
+  cci-blackbook:
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data/source:/data/source:ro
+      - ./data/index:/data/index
+      - ./data/cache:/data/cache
