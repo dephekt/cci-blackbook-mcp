@@ -24,8 +24,8 @@ services:
       CCI_SOURCE_PDF: /data/source/document.pdf
       CCI_INDEX_DIR: /data/index
       CCI_CACHE_DIR: /data/cache
-      # "voyage" = real retrieval quality (needs VOYAGE_API_KEY); "stub" = offline
-      # hash embeddings, no key required — handy for a quick local smoke test.
+      # Voyage embeddings (requires VOYAGE_API_KEY). "stub" exists only so the
+      # offline test suite can run without a key; it is not a useful backend.
       CCI_EMBEDDING_BACKEND: ${CCI_EMBEDDING_BACKEND:-voyage}
       CCI_VOYAGE_TEXT_MODEL: voyage-context-4
       CCI_VOYAGE_IMAGE_MODEL: voyage-multimodal-3.5
