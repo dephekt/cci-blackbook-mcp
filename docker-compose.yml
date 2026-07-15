@@ -4,8 +4,6 @@ services:
   cci-blackbook:
     build:
       context: .
-      args:
-        CCI_INSTALL_ONNXRUNTIME_OPENVINO: "true"
     image: cci-blackbook-mcp:local
     container_name: cci-blackbook
     restart: unless-stopped
@@ -34,18 +32,8 @@ services:
       CCI_BLANK_MAX_COLOR: "0.005"
       CCI_MCP_HOST: 0.0.0.0
       CCI_MCP_PORT: "8000"
-      # legacy FastEmbed/OpenVINO knobs — unused by the voyage backend; the GPU
-      # device mounts below are harmless and removed in the deferred follow-up.
-      CCI_EMBEDDING_MODEL: BAAI/bge-small-en-v1.5
-      CCI_OPENVINO_DEVICE: GPU
-      CCI_RENDER_DEVICE: /dev/dri/renderD129
-      CCI_EMBEDDING_BATCH_SIZE: "8"
     expose:
       - "8000"
-    devices:
-      - /dev/dri/renderD129:/dev/dri/renderD129
-    group_add:
-      - "993"
     volumes:
       - /mnt/data/cci-blackbook/source:/data/source:ro
       - /mnt/data/cci-blackbook/index:/data/index

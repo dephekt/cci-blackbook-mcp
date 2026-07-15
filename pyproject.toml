@@ -4,10 +4,8 @@ version = "0.1.0"
 description = "FastMCP retrieval service for the CCI Black Book."
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "fastembed>=0.6,<0.8",
     "fastmcp>=2.13,<4",
     "numpy>=1.26,<3",
-    "onnxruntime-openvino>=1.22,<2",
     "pillow>=11,<12",
     "pymupdf>=1.28.0",
     "starlette>=0.37,<1",

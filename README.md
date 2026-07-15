@@ -5,9 +5,8 @@ The service returns bounded cited evidence packs; Codex or Claude Code synthesiz
 
 This app is managed as a standalone uv project. Runtime dependencies are declared
 in `pyproject.toml` and locked in `uv.lock`; the Docker image installs with
-`uv sync --locked`. The image then force-reinstalls the locked
-`onnxruntime-openvino` wheel with `uv pip` so it overrides FastEmbed's plain
-`onnxruntime` dependency and exposes `OpenVINOExecutionProvider`.
+`uv sync --locked`. PyMuPDF and Pillow ship self-contained wheels, so the image
+needs no poppler or GPU system packages — only outbound HTTPS to Voyage.
 
 ## Embeddings (Voyage dual index)
 
@@ -30,8 +29,7 @@ keeping figure/photo pages. `blackbook_search` supports `mode` =
 Ingest **fails loud** if Voyage is unreachable (the prior index is left intact);
 queries **degrade to FTS-only** if a dense space is unavailable at query time.
 `CCI_EMBEDDING_BACKEND` accepts only `voyage` (default) or `stub` — an offline
-blake2b hash provider used by the tests. The old FastEmbed/OpenVINO code is retained
-but unreachable, pending the deferred GPU-stack removal.
+blake2b hash provider used by the tests.
 
 ### Privacy
 
@@ -79,10 +77,8 @@ make cci-up
 The compose service:
 
 - joins the external `proxy` network for Pangolin/Newt discovery
-- mounts `/dev/dri/renderD129` and adds render group `993`
-- installs Intel GPU userspace drivers from `ppa:kobuk-team/intel-graphics`, matching the media-server host
 - stores the SQLite index at `/mnt/data/cci-blackbook/index/`
-- stores model/cache files at `/mnt/data/cci-blackbook/cache/`
+- stores cache files at `/mnt/data/cci-blackbook/cache/`
 - disables Pangolin SSO because MCP clients authenticate with bearer tokens
 
 Validate Voyage connectivity with synthetic data (safe pre-opt-out), then prebuild

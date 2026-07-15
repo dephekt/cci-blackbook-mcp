@@ -16,12 +16,6 @@ class Settings:
     cache_dir: Path
     sqlite_path: Path
     embedding_backend: str
-    # --- legacy FastEmbed/OpenVINO fields (still parsed for the installed but now
-    # unused local provider + compose; removed in the deferred GPU-stack follow-up) ---
-    embedding_model: str
-    openvino_device: str
-    render_device: Path
-    embedding_batch_size: int
     # --- chunking ---
     chunk_chars: int
     chunk_overlap_chars: int
@@ -118,10 +112,6 @@ def load_settings() -> Settings:
         cache_dir=cache_dir,
         sqlite_path=sqlite_path,
         embedding_backend=os.environ.get("CCI_EMBEDDING_BACKEND", "voyage").lower(),
-        embedding_model=os.environ.get("CCI_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
-        openvino_device=os.environ.get("CCI_OPENVINO_DEVICE", "GPU"),
-        render_device=Path(os.environ.get("CCI_RENDER_DEVICE", "/dev/dri/renderD129")),
-        embedding_batch_size=_int_from_env("CCI_EMBEDDING_BATCH_SIZE", 8),
         chunk_chars=_int_from_env("CCI_CHUNK_CHARS", 1800),
         chunk_overlap_chars=_int_from_env("CCI_CHUNK_OVERLAP_CHARS", 250),
         voyage_text_model=os.environ.get("CCI_VOYAGE_TEXT_MODEL", "voyage-context-4"),
