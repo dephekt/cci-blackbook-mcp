@@ -147,7 +147,10 @@ def load_settings() -> Settings:
         rrf_weight_text=_float_from_env("CCI_RRF_WEIGHT_TEXT", 1.0),
         rrf_weight_image=_float_from_env("CCI_RRF_WEIGHT_IMAGE", 2.0),
         max_units_per_page=_int_from_env("CCI_MAX_UNITS_PER_PAGE", 2),
-        min_expected_median_chars=_int_from_env("CCI_MIN_EXPECTED_MEDIAN_CHARS", 200),
+        # Opt-in OCR-extraction tripwire (median chars over text-bearing pages). Off by
+        # default so the tool works on any PDF, incl. small/visual docs; raise it (e.g.
+        # 200) when indexing a large scanned book to catch a broken OCR layer early.
+        min_expected_median_chars=_int_from_env("CCI_MIN_EXPECTED_MEDIAN_CHARS", 0),
         citation_thumbnails=_bool_from_env("CCI_CITATION_THUMBNAILS", False),
         host=os.environ.get("CCI_MCP_HOST", "0.0.0.0"),
         port=_int_from_env("CCI_MCP_PORT", 8000),
