@@ -5,6 +5,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from math import ceil
 
+from .sources import build_text_unit_id
+
 
 @dataclass(frozen=True)
 class PageText:
@@ -14,7 +16,8 @@ class PageText:
 
 @dataclass(frozen=True)
 class Chunk:
-    chunk_id: str
+    chunk_id: str          # namespaced: "<source_id>:p0012-c000"
+    source_id: str
     page: int
     chunk_index: int
     text: str
@@ -31,6 +34,7 @@ def normalize_text(text: str) -> str:
 
 
 def chunk_page(
+    source_id: str,
     page: int,
     text: str,
     *,
@@ -58,7 +62,8 @@ def chunk_page(
         if chunk_text:
             chunks.append(
                 Chunk(
-                    chunk_id=f"p{page:04d}-c{chunk_index:03d}",
+                    chunk_id=build_text_unit_id(source_id, page, chunk_index),
+                    source_id=source_id,
                     page=page,
                     chunk_index=chunk_index,
                     text=chunk_text,
@@ -77,6 +82,7 @@ def chunk_page(
 
 
 def chunk_pages(
+    source_id: str,
     pages: Iterable[PageText],
     *,
     chunk_chars: int = 1800,
@@ -86,6 +92,7 @@ def chunk_pages(
     for page in pages:
         chunks.extend(
             chunk_page(
+                source_id,
                 page.page,
                 page.text,
                 chunk_chars=chunk_chars,
@@ -130,37 +137,46 @@ def group_chunks_into_documents(
 ) -> list[list[int]]:
     """Page-aligned greedy packing of chunk INDICES into documents <= token_budget.
 
-    A page's chunks are never split across documents (contextualization stays
-    within a page's neighborhood at minimum), every chunk lands in exactly one
-    document, and order is preserved so returned indices zip back to chunk_ids
-    positionally. Raises if any single chunk exceeds max_chunk_tokens.
+    A page's chunks are never split across documents (contextualization stays within a
+    page's neighborhood at minimum), every chunk lands in exactly one document, and order
+    is preserved so returned indices zip back to chunk_ids positionally. The collapse key
+    is (source_id, page) so a book's chunks are never contextualized with another book's,
+    even if this is ever handed a multi-source list. Raises if any single chunk exceeds
+    max_chunk_tokens.
     """
     if not chunks:
         return []
 
-    # Collapse into per-page groups (chunk_pages emits a page's chunks contiguously).
-    pages: list[list] = []  # [page, [indices], token_sum]
+    # Collapse into per-(source, page) groups (a source's chunks arrive contiguously).
+    pages: list[list] = []  # [(source_id, page), [indices], token_sum]
     for idx, chunk in enumerate(chunks):
         tok = estimate_tokens(chunk.text, chars_per_token)
         if tok > max_chunk_tokens:
             raise ValueError(
                 f"chunk {chunk.chunk_id} is ~{tok} tokens, exceeds max_chunk_tokens {max_chunk_tokens}"
             )
-        if pages and pages[-1][0] == chunk.page:
+        key = (chunk.source_id, chunk.page)
+        if pages and pages[-1][0] == key:
             pages[-1][1].append(idx)
             pages[-1][2] += tok
         else:
-            pages.append([chunk.page, [idx], tok])
+            pages.append([key, [idx], tok])
 
     documents: list[list[int]] = []
     current: list[int] = []
     current_tokens = 0
-    for _page, indices, page_tokens in pages:
-        if current and current_tokens + page_tokens > token_budget:
+    current_source: str | None = None
+    for key, indices, page_tokens in pages:
+        source_id = key[0]
+        # Start a new document when the source changes (never contextualize one book's
+        # chunks with another's) or the budget would overflow. A page's chunks are one
+        # `pages` entry, so they are never split across documents.
+        if current and (source_id != current_source or current_tokens + page_tokens > token_budget):
             documents.append(current)
             current, current_tokens = [], 0
         current.extend(indices)
         current_tokens += page_tokens
+        current_source = source_id
     if current:
         documents.append(current)
     return documents

@@ -1,8 +1,9 @@
 # CCI Black Book MCP
 
-An MCP server that does semantic search over the **CCI Black Book** — a large, scanned
-grow manual — and returns bounded, cited evidence packs for an MCP client (Claude Code,
-Codex, …) to answer from.
+An MCP server that does semantic search over **one or more grow manuals** (e.g. the CCI
+Black Book) — a corpus of scanned/image-heavy PDFs — and returns bounded, cited evidence
+packs for an MCP client (Claude Code, Codex, …) to answer from. Every hit is labeled with
+the book it came from, and you can scope a query to specific book(s).
 
 Scanned books are mostly *pictures*. Naive PDF-RAG indexes only the OCR text layer and
 loses every chart, diagram, and photo. This server embeds **both** the text and a render
@@ -12,7 +13,7 @@ of each page, so the visual content is first-class in retrieval.
 
 - A **[Voyage AI](https://www.voyageai.com/) API key** — the embeddings are the whole
   point, so this is required.
-- The source PDF (the CCI Black Book, or another scanned/image-heavy PDF).
+- One or more source PDFs (the CCI Black Book and/or other grow manuals).
 - Docker, or Python 3.12 + [uv](https://docs.astral.sh/uv/).
 
 ## How retrieval works
@@ -28,9 +29,10 @@ Three rankers, fused with weighted Reciprocal Rank Fusion:
 
 Every page is rendered; a conservative, logged blank-page filter drops lined "Notes:"
 template pages (text-poor **and** ink-poor **and** color-poor) while keeping figure pages.
-Results carry `unit_type` = `text` or `image`; image citations use ids like `p0042-img`.
-Ingest **fails loud** if Voyage is unreachable (the prior index is left intact); queries
-**degrade to FTS-only** if a dense space is unavailable.
+Results carry `unit_type` = `text` or `image` plus a `source_id`/`source_title`; unit ids
+are namespaced per book (e.g. `cci-black-book:p0042-img`). Ingest **fails loud** if Voyage
+is unreachable (the prior index is left intact); queries **degrade to FTS-only** if a dense
+space is unavailable.
 
 ## Quickstart
 
@@ -44,8 +46,10 @@ cp secrets/cci.env.example secrets/cci.env
 #      VOYAGE_API_KEY=...                     (from https://www.voyageai.com/)
 #      CCI_VOYAGE_RETENTION_CONFIRMED=true    (after opting out — see Privacy)
 
-# 2. Drop the PDF in.
-mkdir -p data/source && cp "/path/to/CCI Black Book.pdf" data/source/document.pdf
+# 2. Drop one or more PDFs into data/source/. Each file's real name becomes its
+#    source id + title (e.g. "CCI Black Book.pdf" -> cci-black-book / "CCI Black Book").
+mkdir -p data/source
+cp "/path/to/CCI Black Book.pdf" "/path/to/Aroya Guide to Drying.pdf" data/source/
 
 # 3. Build, start, and index (~$0.60 one-time, ~8 min for a ~500-page book).
 docker compose up -d --build
@@ -86,10 +90,15 @@ tool_timeout_sec = 120
 
 ## Tools
 
-- `ask_blackbook(question, crop_context=None, facility_context=None, max_citations=6)`
-- `blackbook_search(query, limit=10, mode="hybrid")` — modes: `hybrid` | `vector` | `fts` | `text` | `image`
-- `blackbook_read_citation(chunk_id)` — accepts a text id (`p0042-c001`) or a page-image id (`p0042-img`)
-- `blackbook_status()`
+- `ask_blackbook(question, crop_context=None, facility_context=None, max_citations=6, sources=None)`
+- `blackbook_search(query, limit=10, mode="hybrid", sources=None)` — modes: `hybrid` | `vector` | `fts` | `text` | `image`
+- `blackbook_read_citation(chunk_id)` — accepts a namespaced text id (`cci-black-book:p0042-c001`) or page-image id (`cci-black-book:p0042-img`)
+- `blackbook_status()` — lists every indexed book with per-book counts
+
+`sources` scopes a query to one book id or a list of them (default: all); ids come from
+`blackbook_status()`. Each result carries `source_id`/`source_title` (the book) — distinct
+from the result's `sources` field, which lists the rankers (fts/text_dense/image_dense)
+that surfaced it.
 
 ## Configuration
 
@@ -100,7 +109,7 @@ Env-driven; the compose file sets sensible defaults. The ones you'll actually se
 | `VOYAGE_API_KEY` | **required** |
 | `CCI_VOYAGE_RETENTION_CONFIRMED` | must be `true` to ingest (see Privacy) |
 | `CCI_BLACKBOOK_MCP_TOKEN` | bearer token clients must send |
-| `CCI_SOURCE_PDF` | defaults to `/data/source/document.pdf` |
+| `CCI_SOURCE_DIR` | directory of PDFs to index (default `/data/source`) |
 | `CCI_RENDER_DPI` | `100` — page render DPI for the image embeddings |
 | `CCI_RRF_WEIGHT_IMAGE` | `2.0` — upweights the image ranker in fusion |
 

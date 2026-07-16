@@ -1,28 +1,28 @@
 from __future__ import annotations
 
 import logging
-import re
 import statistics
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
 
 import numpy as np
 
-from .chunking import PageText, chunk_pages, group_chunks_into_documents
+from .chunking import Chunk, PageText, chunk_pages, group_chunks_into_documents
 from .embeddings import DenseEmbeddingProvider, VoyageUnavailable, build_dense_provider
 from .pagefilter import PageDecision, classify_page, summarize
 from .render import ImageUnit, RenderedPage, page_image_tokens, render_pages
 from .settings import Settings, load_settings, settings_fingerprint, voyage_configured
+from .sources import SourceMeta, corpus_identity, discover_sources, parse_unit_id
 from .store import BlackBookIndex, PageRecord, SearchHit
 
 log = logging.getLogger("cci_blackbook")
 
 
 class IndexUnavailable(RuntimeError):
-    """Source PDF missing or the index is not ready."""
+    """Source directory missing/empty or the index is not ready."""
 
 
 class IngestFailed(RuntimeError):
@@ -35,6 +35,16 @@ class FusedHit:
     hit: SearchHit
     score: float
     sources: tuple[str, ...]
+
+
+@dataclass
+class _SourceIngest:
+    chunks: list[Chunk]
+    chunk_vectors: list[np.ndarray]
+    page_records: list[PageRecord]
+    page_vectors: dict[tuple[str, int], np.ndarray]
+    decisions: list[PageDecision] = field(default_factory=list)
+    documents: int = 0
 
 
 class BlackBookService:
@@ -61,17 +71,27 @@ class BlackBookService:
         )
 
     def status(self) -> dict:
+        d = self.settings.source_dir
+        specs = discover_sources(d)
         index_status = self.index.status()
-        source_status = _source_status(self.settings.source_pdf)
         provider = self._provider or build_dense_provider(self.settings)
         return {
             "service": "cci-blackbook-mcp",
-            "source": source_status,
+            "source_dir": {
+                "path": str(d),
+                "exists": d.exists(),
+                "is_dir": d.is_dir(),
+                "pdf_count": len(specs),
+                "discovered": [
+                    {"source_id": s.id, "title": s.title, "path": str(s.path)} for s in specs
+                ],
+            },
+            "sources": index_status.get("sources", []),  # what is actually indexed, with counts
             "index": index_status,
             "embedding": provider.status(),
             "voyage_configured": voyage_configured(),
             "paths": {
-                "source_pdf": str(self.settings.source_pdf),
+                "source_dir": str(d),
                 "index_dir": str(self.settings.index_dir),
                 "cache_dir": str(self.settings.cache_dir),
             },
@@ -83,34 +103,101 @@ class BlackBookService:
         """Build or refresh the index. Called ONLY by the ingest CLI — never on the
         query path (which must never trigger a paid rebuild)."""
         with self._lock:
-            source_metadata = _source_metadata(self.settings.source_pdf)
+            d = self.settings.source_dir
+            specs = discover_sources(d)
+            discovered = corpus_identity((s.id, str(s.path), s.size, s.mtime_ns) for s in specs)
             index_status = self.index.status()
-            if not force and _index_current(index_status, source_metadata, self.settings):
+            if not force and _index_current(index_status, discovered, self.settings):
                 return {"rebuilt": False, "status": index_status}
-            if not self.settings.source_pdf.exists():
-                raise IndexUnavailable(f"source PDF missing: {self.settings.source_pdf}")
+            if not d.exists():
+                raise IndexUnavailable(f"source directory missing: {d}")
+            if not d.is_dir():
+                raise IndexUnavailable(f"source path is not a directory: {d}")
+            if not specs:
+                raise IndexUnavailable(f"no source PDFs found in {d}")
             self._guard_retention()
             try:
-                return self._rebuild_from_source(source_metadata)
+                return self._rebuild_from_corpus(specs)
             except VoyageUnavailable as exc:
                 raise IngestFailed(f"embedding provider failed during ingest: {exc}") from exc
 
     def _guard_retention(self) -> None:
         if self.settings.embedding_backend == "voyage" and not self.settings.voyage_retention_confirmed:
             raise IngestFailed(
-                "refusing to send the private Black Book to Voyage: confirm the zero-retention "
+                "refusing to send the source PDFs to Voyage: confirm the zero-retention "
                 "opt-out (or accept retention), then set CCI_VOYAGE_RETENTION_CONFIRMED=true"
             )
 
-    def _rebuild_from_source(self, source_metadata: dict) -> dict:
+    def _rebuild_from_corpus(self, specs: list[SourceMeta]) -> dict:
         provider = self._provider or build_dense_provider(self.settings)
+        all_chunks: list[Chunk] = []
+        all_cvecs: list[np.ndarray] = []
+        all_precs: list[PageRecord] = []
+        all_decisions: list[PageDecision] = []
+        all_pvecs: dict[tuple[str, int], np.ndarray] = {}
+        total_docs = 0
+
+        for spec in specs:
+            try:
+                one = self._ingest_one_source(provider, spec)
+            except (IngestFailed, VoyageUnavailable) as exc:
+                raise IngestFailed(f"source {spec.id!r}: {exc}") from exc
+            except Exception as exc:  # e.g. fitz.open on a corrupt PDF
+                raise IngestFailed(f"source {spec.id!r}: {type(exc).__name__}: {exc}") from exc
+            all_chunks += one.chunks
+            all_cvecs += one.chunk_vectors
+            all_precs += one.page_records
+            all_pvecs.update(one.page_vectors)
+            all_decisions += one.decisions
+            total_docs += one.documents
+
+        if not all_chunks and not all_pvecs:
+            raise IngestFailed("corpus produced no indexable text chunks or page images")
+
+        metadata = {
+            "fingerprint": settings_fingerprint(self.settings),
+            "text_embedding": {
+                **provider.status(), "space": "text",
+                "observed_dim": int(all_cvecs[0].shape[0]) if all_cvecs else None,
+            },
+            "image_embedding": {
+                **provider.status(), "space": "image",
+                "observed_dim": int(next(iter(all_pvecs.values())).shape[0]) if all_pvecs else None,
+            },
+            "chunking": {
+                "chunk_chars": self.settings.chunk_chars,
+                "chunk_overlap_chars": self.settings.chunk_overlap_chars,
+            },
+            "grouping": {"documents": total_docs, "doc_token_budget": self.settings.doc_token_budget},
+            "filter": summarize(all_decisions),
+            "built_at": int(time()),
+        }
+        self.index.rebuild(
+            sources=specs, chunks=all_chunks, chunk_vectors=all_cvecs,
+            page_records=all_precs, page_vectors=all_pvecs, metadata=metadata,
+        )
+        self._provider = provider
+        status = self.index.status()
+        return {
+            "rebuilt": True,
+            "source_count": len(specs),
+            "chunk_count": len(all_chunks),
+            "image_unit_count": len(all_pvecs),
+            "pages_dropped": sum(1 for d in all_decisions if not d.kept),
+            "sources": status["sources"],
+            "status": status,
+        }
+
+    def _ingest_one_source(self, provider: DenseEmbeddingProvider, spec: SourceMeta) -> _SourceIngest:
         s = self.settings
-        fk, fd = s.force_keep_pages, s.force_drop_pages
+        sid = spec.id
+        fk = s.force_keep_pages.for_source(sid)
+        fd = s.force_drop_pages.for_source(sid)
 
         page_texts: list[PageText] = []
         page_records: list[PageRecord] = []
         decisions: list[PageDecision] = []
-        image_vectors: dict[int, np.ndarray] = {}
+        page_vectors: dict[tuple[str, int], np.ndarray] = {}
         batch: list[ImageUnit] = []
         batch_tokens = 0
 
@@ -119,10 +206,10 @@ class BlackBookService:
             if not batch:
                 return
             for unit, vec in zip(batch, provider.embed_image_units(batch), strict=True):
-                image_vectors[unit.page] = vec
+                page_vectors[(sid, unit.page)] = vec  # (source_id, page) key from enclosing scope
             batch, batch_tokens = [], 0  # page images released here → one batch resident
 
-        for rp in self._page_source(s.source_pdf):
+        for rp in self._page_source(spec.path):
             decision = classify_page(
                 rp,
                 blank_min_chars=s.blank_min_chars,
@@ -133,7 +220,7 @@ class BlackBookService:
                 disabled=s.blank_filter_disable,
             )
             decisions.append(decision)
-            page_records.append(_page_record(rp, decision))
+            page_records.append(_page_record(sid, rp, decision))
             page_texts.append(PageText(rp.page, rp.ocr_text))  # chunk EVERY page's OCR
             if decision.kept:  # every kept page -> exactly one image unit (even at 0 OCR chars)
                 cost = page_image_tokens(
@@ -146,75 +233,49 @@ class BlackBookService:
                 batch_tokens += cost
         flush()
 
-        self._check_extraction_tripwire(decisions)
-        log.info("blackbook page filter: %s", summarize(decisions))
+        self._check_extraction_tripwire(decisions, sid)
+        log.info("blackbook page filter [%s]: %s", sid, summarize(decisions))
 
-        chunks = chunk_pages(page_texts, chunk_chars=s.chunk_chars, overlap_chars=s.chunk_overlap_chars)
-        if not chunks and not image_vectors:
-            raise IngestFailed("source produced no indexable text chunks or page images")
+        chunks = chunk_pages(sid, page_texts, chunk_chars=s.chunk_chars, overlap_chars=s.chunk_overlap_chars)
+        if chunks:  # per-source grouping: a book's chunks only see their own siblings
+            groups = group_chunks_into_documents(
+                chunks, token_budget=s.doc_token_budget,
+                chars_per_token=s.chars_per_token, max_chunk_tokens=s.max_chunk_tokens,
+            )
+            documents = [[chunks[i].text for i in g] for g in groups]
+            chunk_vectors = _scatter(groups, provider.embed_text_documents(documents), n=len(chunks))
+            ndocs = len(groups)
+        else:
+            chunk_vectors, ndocs = [], 0
 
-        groups = group_chunks_into_documents(
-            chunks, token_budget=s.doc_token_budget,
-            chars_per_token=s.chars_per_token, max_chunk_tokens=s.max_chunk_tokens,
-        )
-        documents = [[chunks[i].text for i in group] for group in groups]
-        doc_vecs = provider.embed_text_documents(documents)
-        chunk_vectors = _scatter(groups, doc_vecs, n=len(chunks))
+        return _SourceIngest(chunks, chunk_vectors, page_records, page_vectors, decisions, ndocs)
 
-        metadata = {
-            "source": source_metadata,
-            "fingerprint": settings_fingerprint(s),
-            "text_embedding": {
-                **provider.status(), "space": "text",
-                "observed_dim": int(chunk_vectors[0].shape[0]) if chunk_vectors else None,
-            },
-            "image_embedding": {
-                **provider.status(), "space": "image",
-                "observed_dim": int(next(iter(image_vectors.values())).shape[0]) if image_vectors else None,
-            },
-            "chunking": {"chunk_chars": s.chunk_chars, "chunk_overlap_chars": s.chunk_overlap_chars},
-            "grouping": {"documents": len(documents), "doc_token_budget": s.doc_token_budget},
-            "filter": summarize(decisions),
-            "built_at": int(time()),
-        }
-        self.index.rebuild(
-            chunks=chunks, chunk_vectors=chunk_vectors,
-            page_records=page_records, page_vectors=image_vectors, metadata=metadata,
-        )
-        self._provider = provider
-        return {
-            "rebuilt": True,
-            "chunk_count": len(chunks),
-            "image_unit_count": len(image_vectors),
-            "pages_dropped": sum(1 for d in decisions if not d.kept),
-            "status": self.index.status(),
-        }
-
-    def _check_extraction_tripwire(self, decisions: list[PageDecision]) -> None:
-        """Guard the fitz-based OCR extraction against a silent break (e.g. the
-        HiddenHorzOCR layer not being read). Measured over TEXT-BEARING pages only,
-        since ~30% of this scanned book is legitimately near-empty (figures, blank
-        "Notes:" templates) and would otherwise drag an all-pages median under the
-        threshold and false-abort a healthy ingest."""
-        threshold = self.settings.min_expected_median_chars
+    def _check_extraction_tripwire(self, decisions: list[PageDecision], source_id: str) -> None:
+        """Opt-in guard against silently broken text extraction, measured over TEXT-BEARING
+        pages only (a source can legitimately have many near-empty figure pages). Threshold
+        is per-source so a value tuned for a scanned book doesn't abort a sparse native one."""
+        threshold = self.settings.min_expected_median_chars.for_source(source_id)
         if threshold <= 0 or not decisions:
             return
         text_pages = [d.char_count for d in decisions if d.char_count > 0]
         if not text_pages:
             raise IngestFailed(
-                "text extraction produced no text on any page; the scanned OCR layer "
-                "may not be readable — aborting before a broken index"
+                f"[{source_id}] text extraction produced no text on any page; the text layer "
+                "may be unreadable (image-only source?) — aborting before a broken index"
             )
         median_chars = statistics.median(text_pages)
         if median_chars < threshold:
             raise IngestFailed(
-                f"text extraction looks sparse (median {median_chars:.0f} chars over "
-                f"text-bearing pages < {threshold}); OCR layer may be partially unreadable — aborting"
+                f"[{source_id}] text extraction looks sparse (median {median_chars:.0f} chars "
+                f"over text-bearing pages < {threshold}); text layer may be unreadable — aborting"
             )
 
     # ---------------------------------------------------------------- retrieve
 
-    def search(self, query: str, *, limit: int = 10, mode: str = "hybrid") -> dict:
+    def search(
+        self, query: str, *, limit: int = 10, mode: str = "hybrid",
+        sources: list[str] | str | None = None,
+    ) -> dict:
         limit = _clamp(limit, 1, 20)
         mode = mode.lower()
         if mode not in {"hybrid", "vector", "fts", "text", "image"}:
@@ -227,17 +288,29 @@ class BlackBookService:
                 "confidence_notes": ["index not built; run cci-blackbook-ingest"],
             }
 
+        known = {r["source_id"] for r in status.get("sources", [])}
+        resolved, source_notes = _resolve_sources(sources, known)
+        if resolved is not None and not resolved:
+            return {
+                "query": query, "mode": mode, "results": [], "abstain": True, "source_filter": sources,
+                "confidence_notes": [f"no requested source is indexed; known: {sorted(known)}", *source_notes],
+            }
+
         provider = self._provider or build_dense_provider(self.settings)
-        fetch = max(limit * 4, 20)
+        n = len(resolved) if resolved else status.get("source_count", 1)
+        fetch = max(limit * 4, 20) * max(1, min(n, 5))  # widen the window with #books (cross-book recall)
         notes_extra: list[str] = []
 
-        fts_hits = self.index.search_fts(query, limit=fetch) if mode in {"fts", "hybrid"} else []
+        fts_hits = (
+            self.index.search_fts(query, limit=fetch, source_ids=resolved)
+            if mode in {"fts", "hybrid"} else []
+        )
 
         text_hits: list[SearchHit] = []
         if mode in {"text", "vector", "hybrid"}:
             try:
                 qvec = provider.embed_text_query(query)
-                raw = self.index.search_vector(qvec, limit=fetch)
+                raw = self.index.search_vector(qvec, limit=fetch, source_ids=resolved)
                 text_hits = [h for h in raw if h.score >= self.settings.min_vector_score]
                 notes_extra.append(f"text-dense: {len(raw)} fetched, {len(text_hits)} >= gate")
             except Exception as exc:
@@ -247,7 +320,7 @@ class BlackBookService:
         if mode in {"image", "vector", "hybrid"}:
             try:
                 qvec = provider.embed_image_query(query)
-                raw = self.index.search_page_vector(qvec, limit=fetch)
+                raw = self.index.search_page_vector(qvec, limit=fetch, source_ids=resolved)
                 image_hits = [h for h in raw if h.score >= self.settings.min_image_score]
                 notes_extra.append(f"image-dense: {len(raw)} fetched, {len(image_hits)} >= gate")
             except Exception as exc:
@@ -263,9 +336,10 @@ class BlackBookService:
             named, limit=limit, k=self.settings.rrf_k, weights=weights,
             max_units_per_page=self.settings.max_units_per_page,
         )
-        notes = _confidence_notes(fused, mode, provider.status()) + notes_extra
+        notes = _confidence_notes(fused, mode, provider.status()) + notes_extra + source_notes
         return {
             "query": query, "mode": mode,
+            "source_filter": (sorted(resolved) if resolved is not None else "all"),
             "results": [_format_hit(item, query) for item in fused],
             "abstain": not fused, "confidence_notes": notes,
         }
@@ -277,6 +351,7 @@ class BlackBookService:
         crop_context: str | None = None,
         facility_context: str | None = None,
         max_citations: int = 6,
+        sources: list[str] | str | None = None,
     ) -> dict:
         parts = [question]
         if crop_context:
@@ -284,17 +359,20 @@ class BlackBookService:
         if facility_context:
             parts.append(f"facility context: {facility_context}")
         search_query = "\n".join(parts)
-        search_result = self.search(search_query, limit=_clamp(max_citations, 1, 10), mode="hybrid")
+        search_result = self.search(
+            search_query, limit=_clamp(max_citations, 1, 10), mode="hybrid", sources=sources
+        )
         return {
             "question": question,
             "crop_context": crop_context,
             "facility_context": facility_context,
             "abstain": search_result["abstain"],
             "answer_instruction": (
-                "Compose the answer from these cited excerpts only. Some citations are scanned "
-                "figure/page images (unit_type='image') whose OCR text may be sparse — call "
+                "Compose the answer from these cited excerpts only. Each citation names its "
+                "source (source_title / source_id). Some citations are page images "
+                "(unit_type='image') whose extracted text may be sparse — call "
                 "blackbook_read_citation to inspect one. If the excerpts do not answer the "
-                "question, say the Black Book evidence is insufficient."
+                "question, say the evidence is insufficient."
             ),
             "evidence": search_result["results"],
             "confidence_notes": search_result["confidence_notes"],
@@ -305,33 +383,52 @@ class BlackBookService:
         if not status.get("ready"):
             return {"chunk_id": chunk_id, "found": False, "error": "index not built; run cci-blackbook-ingest"}
 
-        page = parse_image_unit_id(chunk_id)
-        if page is not None:
-            hit = self.index.read_page(page)
+        uid = self._canonicalize_unit_id(chunk_id, status)
+        parsed = parse_unit_id(uid)
+        if parsed is None:
+            return {"chunk_id": chunk_id, "found": False, "error": "unrecognized unit id"}
+        source_id, page, kind = parsed
+
+        if kind == "image":
+            hit = self.index.read_page(source_id, page)
             if hit is None:
                 return {"chunk_id": chunk_id, "found": False}
             result = {
-                "chunk_id": chunk_id, "unit_id": chunk_id, "found": True, "page": hit.page,
-                "unit_type": "image", "citation": _citation(hit),
-                "text": _bounded_text(hit.text, 2500), "bounded": len(hit.text) > 2500,
-                "note": "match came from the page image; text shown is page OCR (may be sparse)",
+                "chunk_id": uid, "unit_id": uid, "found": True, "page": hit.page,
+                "source_id": hit.source_id, "source_title": hit.source_title, "unit_type": "image",
+                "citation": _citation(hit), "text": _bounded_text(hit.text, 2500),
+                "bounded": len(hit.text) > 2500,
+                "note": "match came from the page image; text shown is the page's extracted text (may be sparse)",
             }
-            thumb = self._maybe_thumbnail(hit.page)
+            thumb = self._maybe_thumbnail(source_id, hit.page)
             if thumb:
                 result["thumbnail_png_base64"] = thumb
             return result
 
-        hit = self.index.read_chunk(chunk_id)
+        hit = self.index.read_chunk(uid)
         if hit is None:
             return {"chunk_id": chunk_id, "found": False}
         return {
             "chunk_id": hit.chunk_id, "unit_id": hit.chunk_id, "found": True, "page": hit.page,
-            "unit_type": "text", "citation": _citation(hit),
-            "text": _bounded_text(hit.text, 2500), "bounded": len(hit.text) > 2500,
+            "source_id": hit.source_id, "source_title": hit.source_title, "unit_type": "text",
+            "citation": _citation(hit), "text": _bounded_text(hit.text, 2500),
+            "bounded": len(hit.text) > 2500,
         }
 
-    def _maybe_thumbnail(self, page: int) -> str | None:
-        if not self.settings.citation_thumbnails or not self.settings.source_pdf.exists():
+    def _canonicalize_unit_id(self, uid: str, status: dict) -> str:
+        """Back-compat for cached bare ids (p0042-img). Only resolvable — and only ever
+        guessed — when exactly one source is indexed; a multi-source corpus always uses
+        namespaced ids returned by search."""
+        if ":" in uid:
+            return uid
+        src = status.get("sources", [])
+        return f"{src[0]['source_id']}:{uid}" if len(src) == 1 else uid
+
+    def _maybe_thumbnail(self, source_id: str, page: int) -> str | None:
+        if not self.settings.citation_thumbnails:
+            return None
+        row = self.index.get_source(source_id)
+        if not row or not Path(row["path"]).exists():
             return None
         try:
             import base64
@@ -340,7 +437,7 @@ class BlackBookService:
             import fitz
             from PIL import Image
 
-            doc = fitz.open(str(self.settings.source_pdf))
+            doc = fitz.open(row["path"])
             try:
                 pg = doc[page - 1]
                 zoom = 1024.0 / max(pg.rect.width, pg.rect.height, 1.0)
@@ -358,8 +455,9 @@ class BlackBookService:
 # ---------------------------------------------------------------------- helpers
 
 
-def _page_record(rp: RenderedPage, decision: PageDecision) -> PageRecord:
+def _page_record(source_id: str, rp: RenderedPage, decision: PageDecision) -> PageRecord:
     return PageRecord(
+        source_id=source_id,
         page=rp.page,
         ocr_text=rp.ocr_text,
         char_count=rp.char_count,
@@ -382,33 +480,34 @@ def _scatter(groups: list[list[int]], doc_vecs: list[list[np.ndarray]], *, n: in
     return out  # type: ignore[return-value]
 
 
-def parse_image_unit_id(uid: str) -> int | None:
-    match = re.match(r"^p(\d+)-img$", uid)
-    return int(match.group(1)) if match else None
+def _resolve_sources(
+    sources: list[str] | str | None, known: set[str]
+) -> tuple[list[str] | None, list[str]]:
+    """Return (resolved_ids, notes). None = all sources (no filter). [] = a filter was
+    requested but no requested id is indexed (caller abstains)."""
+    if sources is None:
+        return None, []
+    req = [sources] if isinstance(sources, str) else list(sources)
+    req = [x.strip().lower() for x in req if isinstance(x, str) and x.strip()]
+    if not req:
+        return None, []
+    valid = [r for r in req if r in known]
+    unknown = [r for r in req if r not in known]
+    notes = [f"ignored unknown sources: {sorted(set(unknown))}"] if unknown else []
+    if valid:
+        notes.insert(0, f"scoped to sources: {sorted(set(valid))}")
+    return valid, notes
 
 
-def _source_status(path: Path) -> dict:
-    if not path.exists():
-        return {"exists": False, "path": str(path)}
-    stat = path.stat()
-    return {"exists": True, "path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
-def _source_metadata(path: Path) -> dict:
-    status = _source_status(path)
-    if not status["exists"]:
-        return status
-    return {"path": status["path"], "size": status["size"], "mtime_ns": status["mtime_ns"]}
-
-
-def _index_current(index_status: dict, source_metadata: dict, settings: Settings) -> bool:
+def _index_current(index_status: dict, discovered: list[dict], settings: Settings) -> bool:
     if not index_status.get("ready"):
         return False
-    metadata = index_status.get("metadata", {})
-    return (
-        metadata.get("source") == source_metadata
-        and metadata.get("fingerprint") == settings_fingerprint(settings)
+    stored = corpus_identity(
+        (r["source_id"], r["path"], r["size"], r["mtime_ns"])
+        for r in index_status.get("sources", [])
     )
+    md = index_status.get("metadata", {})
+    return stored == discovered and md.get("fingerprint") == settings_fingerprint(settings)
 
 
 def _select_lists(
@@ -450,12 +549,13 @@ def _fuse_hits(
 
     ordered = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     out: list[FusedHit] = []
-    per_page: dict[int, int] = {}
+    per_page: dict[tuple[str, int], int] = {}  # cap is per (source, page), not per bare page number
     for uid, score in ordered:
         hit = hits[uid]
-        if max_units_per_page and per_page.get(hit.page, 0) >= max_units_per_page:
+        key = (hit.source_id, hit.page)
+        if max_units_per_page and per_page.get(key, 0) >= max_units_per_page:
             continue
-        per_page[hit.page] = per_page.get(hit.page, 0) + 1
+        per_page[key] = per_page.get(key, 0) + 1
         out.append(FusedHit(hit=hit, score=score, sources=tuple(sorted(sources[uid]))))
         if len(out) >= limit:
             break
@@ -468,23 +568,26 @@ def _format_hit(item: FusedHit, query: str) -> dict:
         "chunk_id": hit.chunk_id,
         "unit_id": hit.chunk_id,
         "unit_type": hit.unit_type,
+        "source_id": hit.source_id,
+        "source_title": hit.source_title,
         "page": hit.page,
         "citation": _citation(hit),
         "retrieval_score": round(item.score, 6),
-        "sources": list(item.sources),
+        "sources": list(item.sources),  # RANKER origins (fts/text_dense/image_dense)
         "excerpt": _excerpt_for(hit, query),
     }
 
 
 def _citation(hit: SearchHit) -> str:
+    title = hit.source_title or hit.source_id
     if hit.unit_type == "image":
-        return f"CCI Black Book page {hit.page} (scanned figure/page image)"
-    return f"CCI Black Book page {hit.page}, chunk {hit.chunk_id}"
+        return f"{title}, p.{hit.page} (page image)"
+    return f"{title}, p.{hit.page}"
 
 
 def _excerpt_for(hit: SearchHit, query: str) -> str:
     if hit.unit_type == "image" and len((hit.text or "").strip()) < 40:
-        return "[scanned figure/page image — little/no OCR text; call blackbook_read_citation]"
+        return "[page image — little/no extracted text; call blackbook_read_citation]"
     return _excerpt(hit.text, query)
 
 
@@ -518,7 +621,7 @@ def _confidence_notes(results: list[FusedHit], mode: str, provider_status: dict)
         "excerpts are bounded; call blackbook_read_citation for one full bounded unit",
     ]
     if not results:
-        notes.append("no matching Black Book units were found")
+        notes.append("no matching units were found")
     if provider_status.get("backend") == "stub":
         notes.append("dense ranking uses the offline stub provider (not Voyage)")
     return notes

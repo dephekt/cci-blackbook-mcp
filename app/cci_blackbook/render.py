@@ -50,7 +50,7 @@ def page_image_tokens(
     width: int, height: int, ocr_len: int, *, pixels_per_token: int, chars_per_token: float
 ) -> int:
     """Voyage limit-token cost of one multimodal image element (image pixels +
-    interleaved OCR text). Pure/scalar, so unit-testable without fitz."""
+    interleaved page text). Pure/scalar, so unit-testable without fitz."""
     return ceil(width * height / pixels_per_token) + ceil(ocr_len / chars_per_token)
 
 

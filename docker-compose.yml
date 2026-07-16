@@ -21,7 +21,7 @@ services:
       - path: ./secrets/cci.env
         required: false
     environment:
-      CCI_SOURCE_PDF: /data/source/document.pdf
+      CCI_SOURCE_DIR: /data/source
       CCI_INDEX_DIR: /data/index
       CCI_CACHE_DIR: /data/cache
       # Voyage embeddings (requires VOYAGE_API_KEY). "stub" exists only so the
