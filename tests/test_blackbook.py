@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 from cci_blackbook.auth import is_authorized
@@ -32,9 +34,10 @@ from cci_blackbook.service import (
     BlackBookService,
     IndexUnavailable,
     IngestFailed,
+    _classify_sources,
     _fuse_hits,
-    _index_current,
     _resolve_sources,
+    _source_identity,
 )
 from cci_blackbook.settings import (
     SCHEMA_VERSION,
@@ -43,19 +46,19 @@ from cci_blackbook.settings import (
     Settings,
     _scoped_int_from_env,
     _scoped_pages_from_env,
-    settings_fingerprint,
+    image_fingerprint,
+    text_fingerprint,
 )
 from cci_blackbook.sources import (
     SourceMeta,
     build_image_unit_id,
     build_text_unit_id,
-    corpus_identity,
     discover_sources,
     parse_unit_id,
     slugify,
     titleize,
 )
-from cci_blackbook.store import BlackBookIndex, PageRecord, SearchHit
+from cci_blackbook.store import BlackBookIndex, PageRecord, PreparedSource, SearchHit
 from PIL import Image
 
 
@@ -137,9 +140,17 @@ def hit(uid, page, source, unit_type="text", sid="src", title="Src") -> SearchHi
     return SearchHit(uid, sid, title, page, 0, "x", 0.0, source, unit_type)
 
 
-def _corpus_identity(source_dir: Path) -> list[dict]:
-    return corpus_identity(
-        (s.id, str(s.path), s.size, s.mtime_ns) for s in discover_sources(source_dir)
+def prepared_source(source, chunks, chunk_vectors, pages, page_vectors, *, sha="0" * 64):
+    return PreparedSource(
+        source=source,
+        content_sha256=sha,
+        text_fingerprint="text-fingerprint",
+        image_fingerprint="image-fingerprint",
+        indexed_at=1,
+        chunks=chunks,
+        chunk_vectors=chunk_vectors,
+        page_records=pages,
+        page_vectors=page_vectors,
     )
 
 
@@ -357,7 +368,7 @@ class StoreTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def _rebuild(self):
-        sources = [SourceMeta("src", "Src", Path("/x/Src.pdf"), 1, 1, 0)]
+        source = SourceMeta("src", "Src", Path("/x/Src.pdf"), 1, 1, 0)
         chunks = [
             Chunk("src:p0001-c000", "src", 1, 0, "vapor pressure deficit transpiration", 0, 1),
             Chunk("src:p0002-c000", "src", 2, 0, "reverse osmosis water ppm", 0, 1),
@@ -369,17 +380,29 @@ class StoreTest(unittest.TestCase):
             PageRecord("src", 3, "", 0, 0.001, 0.0, 60, 80, False, "dropped:blank"),
         ]
         pvecs = {("src", 1): np.array([1.0, 0.0], np.float32), ("src", 2): np.array([0.0, 1.0], np.float32)}
-        self.index.rebuild(
-            sources=sources, chunks=chunks, chunk_vectors=cvecs,
-            page_records=pages, page_vectors=pvecs, metadata={"k": 1},
+        self.index.replace_sources(
+            remove_source_ids=set(),
+            prepared_sources=[prepared_source(source, chunks, cvecs, pages, pvecs)],
+            discovered_sources=[source],
+            metadata={"k": 1},
+            expected_text_dim=2,
+            expected_image_dim=2,
+            initialize=True,
         )
 
-    def test_rebuild_rolls_back_to_prior_index_on_insert_failure(self):
-        # The headline atomicity guarantee: a failure INSIDE the rebuild txn (after
-        # BEGIN + DROP + CREATE) must roll back to the prior good index, not leave it
-        # dropped/half-built. Guards against a regression to executescript / dropping BEGIN.
+    def test_replace_rolls_back_to_prior_index_on_insert_failure(self):
+        # A failure inside source replacement must restore every prior table and metadata row.
         self._rebuild()
         self.assertEqual(self.index.status()["chunk_count"], 2)
+        tables = (
+            "meta", "sources", "chunks", "chunks_fts", "embeddings", "pages",
+            "page_embeddings",
+        )
+        with self.index.connect() as conn:
+            before = {
+                table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table}")]
+                for table in tables
+            }
 
         # Two chunks share one chunk_id -> PK violation on the chunks INSERT, which runs
         # after BEGIN/DROP/CREATE. Everything else is valid (passes pre-txn validation).
@@ -388,13 +411,19 @@ class StoreTest(unittest.TestCase):
             Chunk("src:p0001-c000", "src", 1, 1, "b", 0, 1),
         ]
         with self.assertRaises(sqlite3.IntegrityError):
-            self.index.rebuild(
-                sources=[SourceMeta("src", "Src", Path("/x/Src.pdf"), 1, 1, 0)],
-                chunks=dup,
-                chunk_vectors=[np.array([1.0, 0.0], np.float32), np.array([0.0, 1.0], np.float32)],
-                page_records=[PageRecord("src", 1, "a", 1, 0.3, 0.0, 10, 10, True, "kept:content")],
-                page_vectors={("src", 1): np.array([1.0, 0.0], np.float32)},
+            source = SourceMeta("src", "Src", Path("/x/Src.pdf"), 1, 1, 0)
+            pages = [PageRecord("src", 1, "a", 1, 0.3, 0.0, 10, 10, True, "kept:content")]
+            vectors = [np.array([1.0, 0.0], np.float32), np.array([0.0, 1.0], np.float32)]
+            self.index.replace_sources(
+                remove_source_ids={"src"},
+                prepared_sources=[prepared_source(
+                    source, dup, vectors, pages,
+                    {("src", 1): np.array([1.0, 0.0], np.float32)},
+                )],
+                discovered_sources=[source],
                 metadata={"k": 2},
+                expected_text_dim=2,
+                expected_image_dim=2,
             )
 
         st = self.index.status()
@@ -403,6 +432,11 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(st["source_count"], 1)
         with self.index.connect() as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            after = {
+                table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table}")]
+                for table in tables
+            }
+        self.assertEqual(after, before)
 
     def test_dual_space_roundtrip(self):
         self._rebuild()
@@ -441,65 +475,96 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(page_pk, {"source_id", "page"})
         self.assertEqual(pe_pk, {"source_id", "page"})
 
+    def test_source_manifest_fields_are_stored_but_not_public(self):
+        self._rebuild()
+        manifest = self.index.source_manifests()[0]
+        for field in (
+            "content_sha256", "text_fingerprint", "image_fingerprint", "indexed_at"
+        ):
+            self.assertIn(field, manifest)
+            self.assertNotIn(field, self.index.status()["sources"][0])
 
-class MigrationTest(unittest.TestCase):
-    def test_rebuild_over_old_v2_index(self):
+
+class LegacyRebuildTest(unittest.TestCase):
+    @staticmethod
+    def _seed_v3(sqlite_path: Path) -> bytes:
+        sqlite_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(sqlite_path)
+        conn.execute("PRAGMA user_version = 3")
+        conn.execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)")
+        conn.execute("INSERT INTO legacy_marker VALUES ('keep-me')")
+        conn.commit()
+        conn.close()
+        return sqlite_path.read_bytes()
+
+    def test_normal_ingest_rejects_v3_without_provider_calls_or_writes(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            sd = root / "source"
-            pdf = write_pdf(sd, "CCI Black Book.pdf")
+            write_pdf(root / "source", "CCI Black Book.pdf")
             sqlite_path = root / "index" / "blackbook.sqlite3"
-            sqlite_path.parent.mkdir(parents=True)
-            # Seed an OLD (v2) index: legacy page-as-PK pages, chunks WITHOUT source_id,
-            # user_version left 0. The DROP+CREATE rebuild must converge it.
-            conn = sqlite3.connect(sqlite_path)
-            conn.executescript(
-                """
-                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, page INTEGER, chunk_index INTEGER,
-                    text TEXT, char_start INTEGER, char_end INTEGER);
-                CREATE TABLE embeddings (chunk_id TEXT PRIMARY KEY, dim INTEGER, vector BLOB);
-                CREATE TABLE pages (page INTEGER PRIMARY KEY, ocr_text TEXT, char_count INTEGER,
-                    ink_coverage REAL, color_fraction REAL, width INTEGER, height INTEGER,
-                    kept INTEGER, reason TEXT);
-                CREATE TABLE page_embeddings (page INTEGER PRIMARY KEY REFERENCES pages(page),
-                    dim INTEGER, vector BLOB);
-                """
-            )
-            conn.execute("INSERT INTO chunks VALUES ('p0001-c000',1,0,'old text',0,8)")
-            conn.execute(
-                "INSERT INTO embeddings VALUES ('p0001-c000',384,?)",
-                (np.zeros(384, np.float32).tobytes(),),
-            )
-            conn.execute("INSERT INTO pages VALUES (1,'old',3,0.3,0.0,60,80,1,'kept:content')")
-            conn.execute(
-                "INSERT INTO page_embeddings VALUES (1,384,?)", (np.zeros(384, np.float32).tobytes(),)
-            )
-            conn.execute("INSERT INTO meta VALUES ('source', '{\"stale\": true}')")
-            conn.commit()
-            conn.close()
+            original = self._seed_v3(sqlite_path)
+            provider = _RecordingStub(dim=64)
+            svc = BlackBookService(make_settings(root), provider=provider)
+            with self.assertRaises(IngestFailed) as ctx:
+                svc.ensure_index(force=False)
+            message = str(ctx.exception)
+            self.assertIn("cci-blackbook-ingest --force", message)
+            self.assertIn("Stop the MCP", message)
+            self.assertIn("allowance", message)
+            self.assertEqual(provider.doc_batches, [])
+            self.assertEqual(provider.image_batches, [])
+            self.assertEqual(sqlite_path.read_bytes(), original)
 
-            settings = make_settings(root, sqlite_path=sqlite_path)
+    def test_forced_rebuild_validates_v4_before_replacement(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            write_pdf(root / "source", "CCI Black Book.pdf")
+            sqlite_path = root / "index" / "blackbook.sqlite3"
+            self._seed_v3(sqlite_path)
 
             def source(_p):
                 yield rp(1, "vapor pressure deficit " * 20, ink=0.3, image=img())
 
-            svc = BlackBookService(settings, page_source=source)
-            self.assertTrue(svc.ensure_index(force=False)["rebuilt"])  # stale schema => rebuild
+            svc = BlackBookService(make_settings(root), page_source=source)
+            result = svc.ensure_index(force=True)
+            self.assertTrue(result["rebuilt"])
+            self.assertEqual(result["modified"], ["cci-black-book"])
 
             with svc.index.connect() as c:
                 cols = {r["name"] for r in c.execute("PRAGMA table_info(pages)")}
                 self.assertIn("source_id", cols)
-                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
                 dim = c.execute("SELECT dim FROM embeddings LIMIT 1").fetchone()[0]
                 chunk_id = c.execute("SELECT chunk_id FROM chunks LIMIT 1").fetchone()[0]
-            self.assertEqual(dim, settings.voyage_output_dim)
+                legacy = c.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='legacy_marker'"
+                ).fetchone()[0]
+            self.assertEqual(dim, svc.settings.voyage_output_dim)
             self.assertTrue(chunk_id.startswith("cci-black-book:"))
+            self.assertEqual(legacy, 0)
             st = svc.index.status()
             self.assertEqual({s["source_id"] for s in st["sources"]}, {"cci-black-book"})
             self.assertIn("fingerprint", st["metadata"])
-            self.assertTrue(_index_current(st, _corpus_identity(sd), settings))
-            self.assertTrue(pdf.exists())
+
+    def test_failed_temporary_validation_leaves_v3_intact(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            write_pdf(root / "source", "CCI Black Book.pdf")
+            sqlite_path = root / "index" / "blackbook.sqlite3"
+            original = self._seed_v3(sqlite_path)
+
+            def source(_p):
+                yield rp(1, "vapor pressure deficit " * 20, ink=0.3, image=img())
+
+            svc = BlackBookService(make_settings(root), page_source=source)
+            with mock.patch.object(
+                BlackBookIndex, "validate_database", side_effect=RuntimeError("validation failed")
+            ):
+                with self.assertRaises(IngestFailed):
+                    svc.ensure_index(force=True)
+            self.assertEqual(sqlite_path.read_bytes(), original)
+            self.assertEqual(svc.index.schema_version(), 3)
+            self.assertEqual(list(sqlite_path.parent.glob("*.tmp")), [])
 
 
 class FuseTest(unittest.TestCase):
@@ -642,10 +707,15 @@ class _RecordingStub(StubDenseProvider):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.doc_batches: list[list[list[str]]] = []
+        self.image_batches: list[list[str]] = []
 
     def embed_text_documents(self, documents):
         self.doc_batches.append([list(doc) for doc in documents])
         return super().embed_text_documents(documents)
+
+    def embed_image_units(self, units):
+        self.image_batches.append([unit.ocr_text for unit in units])
+        return super().embed_image_units(units)
 
 
 class PerSourceContextualizationTest(unittest.TestCase):
@@ -669,6 +739,314 @@ class PerSourceContextualizationTest(unittest.TestCase):
                     self.assertTrue(("MARKERCCI" in joined) ^ ("MARKERAROYA" in joined))  # exactly one book
 
 
+class IncrementalIngestionTest(unittest.TestCase):
+    @staticmethod
+    def _write_source(directory: Path, name: str, marker: str) -> Path:
+        path = write_pdf(directory, name)
+        path.write_text(marker)
+        return path
+
+    @staticmethod
+    def _page_source(path: Path):
+        marker = path.read_text().strip()
+        return iter([rp(1, f"{marker} searchable content " * 8, ink=0.4, image=img())])
+
+    @staticmethod
+    def _recorded_text(provider: _RecordingStub) -> str:
+        return " ".join(
+            chunk
+            for call in provider.doc_batches
+            for document in call
+            for chunk in document
+        )
+
+    @staticmethod
+    def _recorded_images(provider: _RecordingStub) -> str:
+        return " ".join(text for call in provider.image_batches for text in call)
+
+    @staticmethod
+    def _source_vectors(index: BlackBookIndex, source_id: str) -> tuple[list[bytes], list[bytes]]:
+        with index.connect() as conn:
+            text_vectors = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT e.vector FROM embeddings e JOIN chunks c ON c.chunk_id=e.chunk_id "
+                    "WHERE c.source_id=? ORDER BY c.chunk_id",
+                    (source_id,),
+                )
+            ]
+            image_vectors = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT vector FROM page_embeddings WHERE source_id=? ORDER BY page",
+                    (source_id,),
+                )
+            ]
+        return text_vectors, image_vectors
+
+    def test_noop_performs_zero_embedding_calls(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._write_source(root / "source", "CCI Black Book.pdf", "MARKERCCI")
+            first = BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=self._page_source,
+            )
+            first.ensure_index()
+
+            recorder = _RecordingStub(dim=64)
+            second = BlackBookService(
+                make_settings(root),
+                page_source=lambda _path: self.fail("no-op rendered a source"),
+            )
+            with mock.patch(
+                "cci_blackbook.service.build_dense_provider", return_value=recorder
+            ) as build_provider:
+                result = second.ensure_index()
+            build_provider.assert_not_called()
+            self.assertFalse(result["rebuilt"])
+            self.assertEqual(result["unchanged"], ["cci-black-book"])
+            self.assertEqual(result["sources_embedded"], 0)
+            self.assertEqual(recorder.doc_batches, [])
+            self.assertEqual(recorder.image_batches, [])
+
+    def test_pages_dropped_remains_corpus_wide_across_incremental_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source_dir = root / "source"
+            self._write_source(source_dir, "CCI Black Book.pdf", "DROPPED_A")
+
+            def page_source(path: Path):
+                marker = path.read_text().strip()
+                pages = [rp(1, f"{marker} searchable content " * 8, ink=0.4, image=img())]
+                if marker.startswith("DROPPED"):
+                    pages.append(rp(2, "", ink=0.0, color=0.0, image=img()))
+                return iter(pages)
+
+            def assert_corpus_total(result, expected):
+                self.assertEqual(result["pages_dropped"], expected)
+                self.assertEqual(
+                    result["pages_dropped"],
+                    result["status"]["metadata"]["filter"]["dropped"],
+                )
+
+            initial = BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=page_source,
+            ).ensure_index()
+            assert_corpus_total(initial, 1)
+
+            no_op = BlackBookService(
+                make_settings(root),
+                page_source=lambda _path: self.fail("no-op rendered a source"),
+            ).ensure_index()
+            assert_corpus_total(no_op, 1)
+
+            added_pdf = self._write_source(
+                source_dir, "aroya_guide_to_drying.pdf", "CLEAN_B"
+            )
+            added = BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=page_source,
+            ).ensure_index()
+            assert_corpus_total(added, 1)
+
+            added_pdf.write_text("CLEAN_C")
+            modified = BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=page_source,
+            ).ensure_index()
+            assert_corpus_total(modified, 1)
+
+            added_pdf.unlink()
+            removed = BlackBookService(
+                make_settings(root),
+                page_source=lambda _path: self.fail("removal-only run rendered a source"),
+            ).ensure_index()
+            assert_corpus_total(removed, 1)
+
+    def test_add_embeds_only_new_source_and_preserves_existing_vectors(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source_dir = root / "source"
+            self._write_source(source_dir, "CCI Black Book.pdf", "MARKERCCI")
+            first = BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=self._page_source,
+            )
+            first.ensure_index()
+            prior_vectors = self._source_vectors(first.index, "cci-black-book")
+
+            self._write_source(source_dir, "aroya_guide_to_drying.pdf", "MARKERAROYA")
+            recorder = _RecordingStub(dim=64)
+            second = BlackBookService(
+                make_settings(root), provider=recorder, page_source=self._page_source
+            )
+            result = second.ensure_index()
+            self.assertEqual(result["added"], ["aroya-guide-to-drying"])
+            self.assertEqual(result["unchanged"], ["cci-black-book"])
+            self.assertNotIn("MARKERCCI", self._recorded_text(recorder))
+            self.assertNotIn("MARKERCCI", self._recorded_images(recorder))
+            self.assertIn("MARKERAROYA", self._recorded_text(recorder))
+            self.assertIn("MARKERAROYA", self._recorded_images(recorder))
+            self.assertEqual(
+                self._source_vectors(second.index, "cci-black-book"), prior_vectors
+            )
+
+    def test_modify_rebuilds_both_spaces_for_only_that_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source_dir = root / "source"
+            cci = self._write_source(source_dir, "CCI Black Book.pdf", "OLDCANOPY")
+            self._write_source(source_dir, "aroya_guide_to_drying.pdf", "MARKERAROYA")
+            BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=self._page_source,
+            ).ensure_index()
+
+            prior_stat = cci.stat()
+            cci.write_text("NEWFLOWER")  # same byte length as OLDCANOPY
+            os.utime(cci, ns=(prior_stat.st_atime_ns, prior_stat.st_mtime_ns))
+            recorder = _RecordingStub(dim=64)
+            service = BlackBookService(
+                make_settings(root), provider=recorder, page_source=self._page_source
+            )
+            result = service.ensure_index()
+            self.assertEqual(result["modified"], ["cci-black-book"])
+            self.assertEqual(result["unchanged"], ["aroya-guide-to-drying"])
+            self.assertIn("NEWFLOWER", self._recorded_text(recorder))
+            self.assertIn("NEWFLOWER", self._recorded_images(recorder))
+            self.assertNotIn("MARKERAROYA", self._recorded_text(recorder))
+            self.assertNotIn("MARKERAROYA", self._recorded_images(recorder))
+            self.assertTrue(service.search("OLDCANOPY", mode="fts")["abstain"])
+            self.assertFalse(service.search("NEWFLOWER", mode="fts")["abstain"])
+
+    def test_text_fingerprint_change_rebuilds_both_spaces(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self._write_source(root / "source", "CCI Black Book.pdf", "MARKERCCI")
+            base = make_settings(root)
+            BlackBookService(
+                base, provider=_RecordingStub(dim=64), page_source=self._page_source
+            ).ensure_index()
+
+            recorder = _RecordingStub(dim=64)
+            changed = replace(base, voyage_text_model="voyage-context-next")
+            result = BlackBookService(
+                changed, provider=recorder, page_source=self._page_source
+            ).ensure_index()
+            self.assertEqual(result["modified"], ["cci-black-book"])
+            self.assertTrue(recorder.doc_batches)
+            self.assertTrue(recorder.image_batches)
+
+    def test_source_image_fingerprint_change_rebuilds_both_spaces_for_named_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source_dir = root / "source"
+            self._write_source(source_dir, "CCI Black Book.pdf", "MARKERCCI")
+            self._write_source(source_dir, "aroya_guide_to_drying.pdf", "MARKERAROYA")
+            base = make_settings(root)
+            BlackBookService(
+                base, provider=_RecordingStub(dim=64), page_source=self._page_source
+            ).ensure_index()
+
+            recorder = _RecordingStub(dim=64)
+            overrides = ScopedPages(frozenset(), (("cci-black-book", frozenset({99})),))
+            changed = replace(base, force_keep_pages=overrides)
+            result = BlackBookService(
+                changed, provider=recorder, page_source=self._page_source
+            ).ensure_index()
+            self.assertEqual(result["modified"], ["cci-black-book"])
+            self.assertEqual(result["unchanged"], ["aroya-guide-to-drying"])
+            self.assertIn("MARKERCCI", self._recorded_text(recorder))
+            self.assertIn("MARKERCCI", self._recorded_images(recorder))
+            self.assertNotIn("MARKERAROYA", self._recorded_text(recorder))
+            self.assertNotIn("MARKERAROYA", self._recorded_images(recorder))
+
+    def test_remove_uses_no_provider_and_deletes_all_source_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source_dir = root / "source"
+            self._write_source(source_dir, "CCI Black Book.pdf", "MARKERCCI")
+            removed_pdf = self._write_source(
+                source_dir, "aroya_guide_to_drying.pdf", "MARKERAROYA"
+            )
+            first = BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=self._page_source,
+            )
+            first.ensure_index()
+            prior_vectors = self._source_vectors(first.index, "cci-black-book")
+            removed_pdf.unlink()
+
+            recorder = _RecordingStub(dim=64)
+            second = BlackBookService(
+                make_settings(root),
+                page_source=lambda _path: self.fail("removal-only run rendered a source"),
+            )
+            with mock.patch(
+                "cci_blackbook.service.build_dense_provider", return_value=recorder
+            ) as build_provider:
+                result = second.ensure_index()
+            build_provider.assert_not_called()
+            self.assertEqual(result["removed"], ["aroya-guide-to-drying"])
+            self.assertEqual(result["unchanged"], ["cci-black-book"])
+            self.assertEqual(recorder.doc_batches, [])
+            self.assertEqual(recorder.image_batches, [])
+            self.assertEqual(
+                self._source_vectors(second.index, "cci-black-book"), prior_vectors
+            )
+            with second.index.connect() as conn:
+                for table in ("sources", "chunks", "embeddings", "pages", "page_embeddings"):
+                    column = "source_id" if table != "embeddings" else "chunk_id"
+                    value = (
+                        "aroya-guide-to-drying"
+                        if column == "source_id"
+                        else "aroya-guide-to-drying:%"
+                    )
+                    operator = "=" if column == "source_id" else "LIKE"
+                    count = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {column} {operator} ?", (value,)
+                    ).fetchone()[0]
+                    self.assertEqual(count, 0, table)
+                raw_fts = conn.execute(
+                    "SELECT COUNT(*) FROM chunks_fts WHERE chunk_id LIKE ?",
+                    ("aroya-guide-to-drying:%",),
+                ).fetchone()[0]
+            self.assertEqual(raw_fts, 0)
+            self.assertFalse(
+                second.read_citation("aroya-guide-to-drying:p0001-c000")["found"]
+            )
+
+    def test_empty_directory_never_clears_existing_index(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            pdf = self._write_source(
+                root / "source", "CCI Black Book.pdf", "MARKERCCI"
+            )
+            first = BlackBookService(
+                make_settings(root), provider=_RecordingStub(dim=64),
+                page_source=self._page_source,
+            )
+            first.ensure_index()
+            before = first.settings.sqlite_path.read_bytes()
+            pdf.unlink()
+
+            for force in (False, True):
+                recorder = _RecordingStub(dim=64)
+                service = BlackBookService(make_settings(root))
+                with mock.patch(
+                    "cci_blackbook.service.build_dense_provider", return_value=recorder
+                ) as build_provider:
+                    with self.assertRaises(IndexUnavailable):
+                        service.ensure_index(force=force)
+                build_provider.assert_not_called()
+                self.assertEqual(recorder.doc_batches, [])
+                self.assertEqual(recorder.image_batches, [])
+                self.assertEqual(service.settings.sqlite_path.read_bytes(), before)
+                self.assertEqual(service.index.status()["source_count"], 1)
+
+
 class SchemaGuardTest(unittest.TestCase):
     def test_stale_schema_version_not_ready(self):
         with tempfile.TemporaryDirectory() as d:
@@ -682,7 +1060,7 @@ class SchemaGuardTest(unittest.TestCase):
             svc.ensure_index(force=True)
             self.assertTrue(svc.index.status()["ready"])
 
-            conn = svc.index.connect()  # simulate a pre-v3 index
+            conn = svc.index.connect()  # simulate a legacy index header
             try:
                 conn.execute("PRAGMA user_version = 2")
                 conn.commit()
@@ -691,7 +1069,7 @@ class SchemaGuardTest(unittest.TestCase):
 
             st = svc.index.status()
             self.assertFalse(st["ready"])
-            self.assertIn("schema out of date", st["reason"])
+            self.assertIn("cci-blackbook-ingest --force", st["reason"])
             self.assertTrue(svc.search("vapor", mode="hybrid")["abstain"])
             self.assertFalse(svc.read_citation("cci-black-book:p0001-c000")["found"])
 
@@ -941,17 +1319,27 @@ class FailLoudTest(unittest.TestCase):
 class FailLoudCorpusTest(unittest.TestCase):
     def test_missing_source_dir(self):
         with tempfile.TemporaryDirectory() as d:
-            svc = BlackBookService(make_settings(Path(d)))  # root/source does not exist
+            provider = _RecordingStub(dim=64)
+            svc = BlackBookService(
+                make_settings(Path(d)), provider=provider
+            )  # root/source does not exist
             with self.assertRaises(IndexUnavailable):
                 svc.ensure_index(force=True)
+            self.assertEqual(provider.doc_batches, [])
+            self.assertEqual(provider.image_batches, [])
 
     def test_empty_source_dir(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / "source").mkdir()
-            svc = BlackBookService(make_settings(root))
-            with self.assertRaises(IndexUnavailable):
-                svc.ensure_index(force=True)
+            for force in (False, True):
+                provider = _RecordingStub(dim=64)
+                svc = BlackBookService(make_settings(root), provider=provider)
+                with self.assertRaises(IndexUnavailable):
+                    svc.ensure_index(force=force)
+                self.assertEqual(provider.doc_batches, [])
+                self.assertEqual(provider.image_batches, [])
+                self.assertFalse(svc.settings.sqlite_path.exists())
 
     def test_second_source_failure_leaves_prior_index(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1054,44 +1442,75 @@ class DegradationTest(unittest.TestCase):
 
 
 class FingerprintTest(unittest.TestCase):
-    def _ready_status(self, settings, source_dir):
-        specs = discover_sources(source_dir)
-        return {
-            "ready": True,
-            "sources": [
-                {"source_id": s.id, "path": str(s.path), "size": s.size, "mtime_ns": s.mtime_ns}
-                for s in specs
-            ],
-            "metadata": {"fingerprint": settings_fingerprint(settings)},
-        }
-
-    def test_invalidation(self):
+    def test_canonical_fingerprints_include_pipeline_inputs_only(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            sd = root / "source"
-            write_pdf(sd, "CCI Black Book.pdf")
             base = make_settings(root)
-            status = self._ready_status(base, sd)
-            disc = _corpus_identity(sd)
-            self.assertTrue(_index_current(status, disc, base))
+            base_text = text_fingerprint(base)
+            base_image = image_fingerprint(base, "cci-black-book")
 
             for change in (
-                dict(voyage_text_model="voyage-context-3"),
-                dict(voyage_output_dim=256),
-                dict(render_dpi=150),
-                dict(chunk_chars=1000),
-                dict(blank_min_chars=50),
-                dict(force_keep_pages=ScopedPages.all({7})),
-                dict(embedding_backend="voyage"),
+                {"voyage_text_model": "voyage-context-3"},
+                {"voyage_output_dim": 256},
+                {"chunk_chars": 1000},
+                {"doc_token_budget": 20000},
+                {"max_chunk_tokens": 20000},
+                {"embedding_backend": "voyage"},
             ):
-                self.assertFalse(
-                    _index_current(status, disc, replace(base, **change)),
-                    f"expected invalidation for {change}",
+                self.assertNotEqual(base_text, text_fingerprint(replace(base, **change)))
+
+            for change in (
+                {"voyage_image_model": "voyage-multimodal-3"},
+                {"voyage_output_dim": 256},
+                {"render_dpi": 150},
+                {"blank_min_chars": 50},
+                {"force_keep_pages": ScopedPages.all({7})},
+                {"embedding_backend": "voyage"},
+            ):
+                self.assertNotEqual(
+                    base_image,
+                    image_fingerprint(replace(base, **change), "cci-black-book"),
                 )
 
-            # corpus change: add a second PDF -> discovered differs from stored
-            write_pdf(sd, "aroya_guide_to_drying.pdf")
-            self.assertFalse(_index_current(status, _corpus_identity(sd), base))
+            for change in (
+                {"min_vector_score": 0.9},
+                {"rrf_k": 10},
+                {"mm_token_budget": 10},
+                {"mm_max_inputs": 1},
+                {"min_expected_median_chars": ScopedInt.all(200)},
+            ):
+                changed = replace(base, **change)
+                self.assertEqual(base_text, text_fingerprint(changed))
+                self.assertEqual(base_image, image_fingerprint(changed, "cci-black-book"))
+
+    def test_classification_uses_hash_and_both_fingerprints(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            pdf = write_pdf(root / "source", "CCI Black Book.pdf")
+            settings = make_settings(root)
+            source = discover_sources(pdf.parent)[0]
+            identity = _source_identity(source, settings)
+            manifest = {
+                "source_id": source.id,
+                "content_sha256": identity.content_sha256,
+                "text_fingerprint": identity.text_fingerprint,
+                "image_fingerprint": identity.image_fingerprint,
+            }
+            self.assertEqual(
+                _classify_sources([identity], [manifest], force=False)["unchanged"],
+                [source.id],
+            )
+            pdf.write_text("changed")
+            changed_source = discover_sources(pdf.parent)[0]
+            changed_identity = _source_identity(changed_source, settings)
+            self.assertEqual(
+                _classify_sources([changed_identity], [manifest], force=False)["modified"],
+                [source.id],
+            )
+            self.assertEqual(
+                _classify_sources([identity], [manifest], force=True)["modified"],
+                [source.id],
+            )
 
 
 class ResolveSourcesTest(unittest.TestCase):

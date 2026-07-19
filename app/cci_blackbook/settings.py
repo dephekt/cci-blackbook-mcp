@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# Bumping this invalidates every existing index (it is part of the fingerprint) AND is
-# written to the DB header (PRAGMA user_version), so a physically stale-shaped index is
-# detected before any source-aware query runs. Forces a clean rebuild on a breaking change.
-SCHEMA_VERSION = 3
+# Schema versions are never migrated in place. A legacy database remains untouched until an
+# explicit offline forced rebuild has produced and validated a separate current database.
+SCHEMA_VERSION = 4
+
+# Explicit implementation revisions keep invalidation deterministic when code changes without
+# a corresponding operator-visible setting change. OCR text is used by both embedding spaces.
+OCR_EXTRACTION_REVISION = 1
+TEXT_PIPELINE_REVISION = 1
+IMAGE_PIPELINE_REVISION = 1
 
 
 @dataclass(frozen=True)
@@ -231,31 +237,62 @@ def voyage_configured() -> bool:
 
 
 def settings_fingerprint(s: Settings) -> dict:
-    """Identity of the pipeline that produced an index. Any change here invalidates a
-    stored index via _index_current, forcing a clean rebuild. Combined with the corpus
-    identity (the `sources` table) and the DB `user_version`, this is what makes an
-    out-of-date index rebuild cleanly."""
+    """Global pipeline diagnostics. Per-source fingerprints control invalidation."""
     return {
         "schema_version": SCHEMA_VERSION,
-        "backend": s.embedding_backend,
-        "text_model": s.voyage_text_model,
-        "image_model": s.voyage_image_model,
-        "output_dim": s.voyage_output_dim,
-        "output_dtype": s.voyage_output_dtype,
-        "chunk_chars": s.chunk_chars,
-        "chunk_overlap_chars": s.chunk_overlap_chars,
-        "doc_token_budget": s.doc_token_budget,
-        "chars_per_token": s.chars_per_token,
-        "render_dpi": s.render_dpi,
-        "render_max_pixels": s.render_max_pixels,
-        "blank": [
-            s.blank_min_chars,
-            s.blank_max_ink,
-            s.blank_max_color,
-            s.ink_luma_threshold,
-            s.color_sat_threshold,
-            s.blank_filter_disable,
-        ],
-        "force_keep": s.force_keep_pages.fingerprint(),
-        "force_drop": s.force_drop_pages.fingerprint(),
+        "text": json.loads(text_fingerprint(s)),
+        "image_defaults": json.loads(image_fingerprint(s, "")),
+        "source_overrides": {
+            "force_keep": s.force_keep_pages.fingerprint(),
+            "force_drop": s.force_drop_pages.fingerprint(),
+        },
     }
+
+
+def text_fingerprint(s: Settings) -> str:
+    """Canonical identity of text extraction, chunking, grouping, and embeddings."""
+    return _canonical_fingerprint({
+        "pipeline_revision": TEXT_PIPELINE_REVISION,
+        "ocr_extraction_revision": OCR_EXTRACTION_REVISION,
+        "backend": s.embedding_backend,
+        "model": s.voyage_text_model,
+        "output": {"dimension": s.voyage_output_dim, "dtype": s.voyage_output_dtype},
+        "chunking": {"chars": s.chunk_chars, "overlap_chars": s.chunk_overlap_chars},
+        "contextual_grouping": {
+            "revision": 1,
+            "page_aligned": True,
+            "document_token_budget": s.doc_token_budget,
+        },
+        "token_settings": {
+            "chars_per_token": s.chars_per_token,
+            "max_chunk_tokens": s.max_chunk_tokens,
+        },
+    })
+
+
+def image_fingerprint(s: Settings, source_id: str) -> str:
+    """Canonical source-specific identity of rendered multimodal page embeddings."""
+    return _canonical_fingerprint({
+        "pipeline_revision": IMAGE_PIPELINE_REVISION,
+        "ocr_extraction_revision": OCR_EXTRACTION_REVISION,
+        "backend": s.embedding_backend,
+        "model": s.voyage_image_model,
+        "output": {"dimension": s.voyage_output_dim, "dtype": s.voyage_output_dtype},
+        "rendering": {"dpi": s.render_dpi, "max_pixels": s.render_max_pixels},
+        "blank_filter": {
+            "minimum_chars": s.blank_min_chars,
+            "maximum_ink": s.blank_max_ink,
+            "maximum_color": s.blank_max_color,
+            "ink_luma_threshold": s.ink_luma_threshold,
+            "color_saturation_threshold": s.color_sat_threshold,
+            "disabled": s.blank_filter_disable,
+        },
+        "resolved_page_overrides": {
+            "force_keep": sorted(s.force_keep_pages.for_source(source_id)),
+            "force_drop": sorted(s.force_drop_pages.for_source(source_id)),
+        },
+    })
+
+
+def _canonical_fingerprint(value: dict) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))

@@ -51,9 +51,9 @@ cp secrets/cci.env.example secrets/cci.env
 mkdir -p data/source
 cp "/path/to/CCI Black Book.pdf" "/path/to/Aroya Guide to Drying.pdf" data/source/
 
-# 3. Build, start, and index (~$0.60 one-time, ~8 min for a ~500-page book).
+# 3. Build, start, and index (~$0.60 initially, ~8 min for a ~500-page book).
 docker compose up -d --build
-docker compose exec cci-blackbook cci-blackbook-ingest --force
+docker compose exec cci-blackbook cci-blackbook-ingest
 ```
 
 `docker compose up` publishes the MCP on `127.0.0.1:8000` and serves the PDF/index from
@@ -62,6 +62,27 @@ docker compose exec cci-blackbook cci-blackbook-ingest --force
 
 Verify Voyage connectivity first with `cci-blackbook-ingest --smoke` — it sends only
 synthetic data, so it's safe and essentially free.
+
+### Incremental ingestion and schema upgrades
+
+Normal ingestion is source-incremental. It hashes each discovered PDF, compares its stored text
+and image pipeline fingerprints, and embeds only added or modified books. Removed books are
+deleted locally, and an unchanged corpus makes no Voyage calls. Every affected book rebuilds both
+embedding spaces in this first implementation.
+
+Use `make ingest` for normal refreshes. `make ingest-force` is an explicit full rebuild that
+regenerates every embedding and may consume Voyage allowance or incur charges.
+
+Schema-v3 indexes are never migrated or modified in place. Upgrade one offline:
+
+```bash
+docker compose stop cci-blackbook
+docker compose run --rm cci-blackbook cci-blackbook-ingest --force
+docker compose up -d cci-blackbook
+```
+
+The forced command builds and validates a separate schema-v4 database before atomically replacing
+the legacy file. Keep the MCP stopped for the complete one-off command.
 
 ### Privacy
 

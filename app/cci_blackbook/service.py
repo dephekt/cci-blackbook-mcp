@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import statistics
+import tempfile
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from time import time
 
@@ -14,9 +17,17 @@ from .chunking import Chunk, PageText, chunk_pages, group_chunks_into_documents
 from .embeddings import DenseEmbeddingProvider, VoyageUnavailable, build_dense_provider
 from .pagefilter import PageDecision, classify_page, summarize
 from .render import ImageUnit, RenderedPage, page_image_tokens, render_pages
-from .settings import Settings, load_settings, settings_fingerprint, voyage_configured
-from .sources import SourceMeta, corpus_identity, discover_sources, parse_unit_id
-from .store import BlackBookIndex, PageRecord, SearchHit
+from .settings import (
+    SCHEMA_VERSION,
+    Settings,
+    image_fingerprint,
+    load_settings,
+    settings_fingerprint,
+    text_fingerprint,
+    voyage_configured,
+)
+from .sources import SourceMeta, discover_sources, parse_unit_id
+from .store import BlackBookIndex, PageRecord, PreparedSource, SearchHit
 
 log = logging.getLogger("cci_blackbook")
 
@@ -43,8 +54,15 @@ class _SourceIngest:
     chunk_vectors: list[np.ndarray]
     page_records: list[PageRecord]
     page_vectors: dict[tuple[str, int], np.ndarray]
-    decisions: list[PageDecision] = field(default_factory=list)
     documents: int = 0
+
+
+@dataclass(frozen=True)
+class _SourceIdentity:
+    source: SourceMeta
+    content_sha256: str
+    text_fingerprint: str
+    image_fingerprint: str
 
 
 class BlackBookService:
@@ -104,22 +122,82 @@ class BlackBookService:
         query path (which must never trigger a paid rebuild)."""
         with self._lock:
             d = self.settings.source_dir
-            specs = discover_sources(d)
-            discovered = corpus_identity((s.id, str(s.path), s.size, s.mtime_ns) for s in specs)
-            index_status = self.index.status()
-            if not force and _index_current(index_status, discovered, self.settings):
-                return {"rebuilt": False, "status": index_status}
             if not d.exists():
                 raise IndexUnavailable(f"source directory missing: {d}")
             if not d.is_dir():
                 raise IndexUnavailable(f"source path is not a directory: {d}")
+            specs = discover_sources(d)
             if not specs:
                 raise IndexUnavailable(f"no source PDFs found in {d}")
-            self._guard_retention()
+
+            version = self.index.schema_version()
+            if version is not None and version != SCHEMA_VERSION:
+                if not force:
+                    raise IngestFailed(_legacy_rebuild_message(version))
+                return self._force_rebuild_legacy(specs, version)
+
             try:
-                return self._rebuild_from_corpus(specs)
-            except VoyageUnavailable as exc:
-                raise IngestFailed(f"embedding provider failed during ingest: {exc}") from exc
+                identities = [_source_identity(spec, self.settings) for spec in specs]
+            except OSError as exc:
+                raise IngestFailed(
+                    f"failed to hash source PDF before ingest: {type(exc).__name__}: {exc}"
+                ) from exc
+
+            manifests = self.index.source_manifests() if version == SCHEMA_VERSION else []
+            changes = _classify_sources(identities, manifests, force=force)
+            affected = set(changes["added"]) | set(changes["modified"])
+            if not affected and not changes["removed"]:
+                return self._ingest_result(
+                    changes=changes,
+                    prepared=[],
+                    rebuilt=False,
+                    forced=force,
+                )
+
+            provider: DenseEmbeddingProvider | None = None
+            prepared: list[PreparedSource] = []
+            total_documents = 0
+            if affected:
+                self._guard_retention()
+                provider = self._provider or build_dense_provider(self.settings)
+                prepared, total_documents = self._prepare_sources(
+                    provider, identities, affected
+                )
+
+            retained_artifacts = sum(
+                manifest["chunk_count"] + manifest["image_unit_count"]
+                for manifest in manifests
+                if manifest["source_id"] in changes["unchanged"]
+            )
+            prepared_artifacts = sum(
+                len(source.chunks) + len(source.page_vectors) for source in prepared
+            )
+            if retained_artifacts + prepared_artifacts == 0:
+                raise IngestFailed("corpus produced no indexable text chunks or page images")
+
+            metadata = self._metadata(total_documents)
+            try:
+                self.index.replace_sources(
+                    remove_source_ids=set(changes["removed"]) | set(changes["modified"]),
+                    prepared_sources=prepared,
+                    discovered_sources=specs,
+                    metadata=metadata,
+                    expected_text_dim=self.settings.voyage_output_dim,
+                    expected_image_dim=self.settings.voyage_output_dim,
+                    initialize=version is None,
+                )
+            except Exception as exc:
+                raise IngestFailed(
+                    f"atomic index update failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            if provider is not None:
+                self._provider = provider
+            return self._ingest_result(
+                changes=changes,
+                prepared=prepared,
+                rebuilt=True,
+                forced=force,
+            )
 
     def _guard_retention(self) -> None:
         if self.settings.embedding_backend == "voyage" and not self.settings.voyage_retention_confirmed:
@@ -128,65 +206,176 @@ class BlackBookService:
                 "opt-out (or accept retention), then set CCI_VOYAGE_RETENTION_CONFIRMED=true"
             )
 
-    def _rebuild_from_corpus(self, specs: list[SourceMeta]) -> dict:
-        provider = self._provider or build_dense_provider(self.settings)
-        all_chunks: list[Chunk] = []
-        all_cvecs: list[np.ndarray] = []
-        all_precs: list[PageRecord] = []
-        all_decisions: list[PageDecision] = []
-        all_pvecs: dict[tuple[str, int], np.ndarray] = {}
+    def _prepare_sources(
+        self,
+        provider: DenseEmbeddingProvider,
+        identities: list[_SourceIdentity],
+        affected: set[str],
+    ) -> tuple[list[PreparedSource], int]:
+        prepared: list[PreparedSource] = []
         total_docs = 0
-
-        for spec in specs:
+        indexed_at = int(time())
+        for identity in identities:
+            spec = identity.source
+            if spec.id not in affected:
+                continue
             try:
                 one = self._ingest_one_source(provider, spec)
             except (IngestFailed, VoyageUnavailable) as exc:
                 raise IngestFailed(f"source {spec.id!r}: {exc}") from exc
             except Exception as exc:  # e.g. fitz.open on a corrupt PDF
                 raise IngestFailed(f"source {spec.id!r}: {type(exc).__name__}: {exc}") from exc
-            all_chunks += one.chunks
-            all_cvecs += one.chunk_vectors
-            all_precs += one.page_records
-            all_pvecs.update(one.page_vectors)
-            all_decisions += one.decisions
+            prepared.append(PreparedSource(
+                source=spec,
+                content_sha256=identity.content_sha256,
+                text_fingerprint=identity.text_fingerprint,
+                image_fingerprint=identity.image_fingerprint,
+                indexed_at=indexed_at,
+                chunks=one.chunks,
+                chunk_vectors=one.chunk_vectors,
+                page_records=one.page_records,
+                page_vectors=one.page_vectors,
+            ))
             total_docs += one.documents
+        return prepared, total_docs
 
-        if not all_chunks and not all_pvecs:
-            raise IngestFailed("corpus produced no indexable text chunks or page images")
-
-        metadata = {
+    def _metadata(self, documents_embedded: int) -> dict:
+        if self.settings.embedding_backend == "stub":
+            text_model = image_model = "stub"
+            configured = True
+        else:
+            text_model = self.settings.voyage_text_model
+            image_model = self.settings.voyage_image_model
+            configured = voyage_configured()
+        embedding = {
+            "backend": self.settings.embedding_backend,
+            "text_model": text_model,
+            "image_model": image_model,
+            "dim": self.settings.voyage_output_dim,
+            "configured": configured,
+        }
+        return {
             "fingerprint": settings_fingerprint(self.settings),
             "text_embedding": {
-                **provider.status(), "space": "text",
-                "observed_dim": int(all_cvecs[0].shape[0]) if all_cvecs else None,
+                **embedding,
+                "space": "text",
+                "observed_dim": self.settings.voyage_output_dim,
             },
             "image_embedding": {
-                **provider.status(), "space": "image",
-                "observed_dim": int(next(iter(all_pvecs.values())).shape[0]) if all_pvecs else None,
+                **embedding,
+                "space": "image",
+                "observed_dim": self.settings.voyage_output_dim,
             },
             "chunking": {
                 "chunk_chars": self.settings.chunk_chars,
                 "chunk_overlap_chars": self.settings.chunk_overlap_chars,
             },
-            "grouping": {"documents": total_docs, "doc_token_budget": self.settings.doc_token_budget},
-            "filter": summarize(all_decisions),
+            "grouping": {
+                "documents_embedded": documents_embedded,
+                "doc_token_budget": self.settings.doc_token_budget,
+                "chars_per_token": self.settings.chars_per_token,
+                "max_chunk_tokens": self.settings.max_chunk_tokens,
+            },
             "built_at": int(time()),
         }
-        self.index.rebuild(
-            sources=specs, chunks=all_chunks, chunk_vectors=all_cvecs,
-            page_records=all_precs, page_vectors=all_pvecs, metadata=metadata,
-        )
-        self._provider = provider
+
+    def _ingest_result(
+        self,
+        *,
+        changes: dict[str, list[str]],
+        prepared: list[PreparedSource],
+        rebuilt: bool,
+        forced: bool,
+    ) -> dict:
         status = self.index.status()
         return {
-            "rebuilt": True,
-            "source_count": len(specs),
-            "chunk_count": len(all_chunks),
-            "image_unit_count": len(all_pvecs),
-            "pages_dropped": sum(1 for d in all_decisions if not d.kept),
-            "sources": status["sources"],
+            "rebuilt": rebuilt,
+            "forced": forced,
+            "added": changes["added"],
+            "modified": changes["modified"],
+            "removed": changes["removed"],
+            "unchanged": changes["unchanged"],
+            "artifact_spaces_rebuilt": {
+                source_id: ["text", "image"]
+                for source_id in sorted(changes["added"] + changes["modified"])
+            },
+            "sources_embedded": len(prepared),
+            "chunks_embedded": sum(len(source.chunks) for source in prepared),
+            "pages_embedded": sum(len(source.page_vectors) for source in prepared),
+            "source_count": status.get("source_count", 0),
+            "chunk_count": status.get("chunk_count", 0),
+            "image_unit_count": status.get("image_unit_count", 0),
+            "pages_dropped": int(status["metadata"]["filter"]["dropped"]),
+            "sources": status.get("sources", []),
             "status": status,
         }
+
+    def _force_rebuild_legacy(self, specs: list[SourceMeta], version: int) -> dict:
+        """Build and validate v4 separately before atomically replacing a legacy index."""
+        self._guard_retention()
+        provider = self._provider or build_dense_provider(self.settings)
+        try:
+            identities = [_source_identity(spec, self.settings) for spec in specs]
+        except OSError as exc:
+            raise IngestFailed(
+                f"failed to hash source PDF before forced rebuild: {type(exc).__name__}: {exc}"
+            ) from exc
+        affected = {spec.id for spec in specs}
+        prepared, total_documents = self._prepare_sources(
+            provider, identities, affected
+        )
+        if not any(source.chunks or source.page_vectors for source in prepared):
+            raise IngestFailed("corpus produced no indexable text chunks or page images")
+
+        self.settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = tempfile.NamedTemporaryFile(
+            prefix=f".{self.settings.sqlite_path.name}.v4-",
+            suffix=".tmp",
+            dir=self.settings.sqlite_path.parent,
+            delete=False,
+        )
+        temporary_path = Path(handle.name)
+        handle.close()
+        temporary_index = BlackBookIndex(temporary_path, journal_mode="DELETE")
+        expected_counts = {
+            "sources": len(prepared),
+            "chunks": sum(len(source.chunks) for source in prepared),
+            "pages": sum(len(source.page_records) for source in prepared),
+            "image_units": sum(len(source.page_vectors) for source in prepared),
+        }
+        try:
+            temporary_index.replace_sources(
+                remove_source_ids=set(),
+                prepared_sources=prepared,
+                discovered_sources=specs,
+                metadata=self._metadata(total_documents),
+                expected_text_dim=self.settings.voyage_output_dim,
+                expected_image_dim=self.settings.voyage_output_dim,
+                initialize=True,
+            )
+            temporary_index.validate_database(expected_counts)
+            os.replace(temporary_path, self.settings.sqlite_path)
+        except Exception as exc:
+            temporary_path.unlink(missing_ok=True)
+            raise IngestFailed(
+                f"forced schema-v4 temporary build failed; legacy schema v{version} was "
+                f"left unchanged: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        self._provider = provider
+        changes = {
+            "added": [],
+            "modified": sorted(affected),
+            "removed": [],
+            "unchanged": [],
+        }
+        log.info("replaced legacy schema v%s with validated schema v%s", version, SCHEMA_VERSION)
+        return self._ingest_result(
+            changes=changes,
+            prepared=prepared,
+            rebuilt=True,
+            forced=True,
+        )
 
     def _ingest_one_source(self, provider: DenseEmbeddingProvider, spec: SourceMeta) -> _SourceIngest:
         s = self.settings
@@ -248,7 +437,7 @@ class BlackBookService:
         else:
             chunk_vectors, ndocs = [], 0
 
-        return _SourceIngest(chunks, chunk_vectors, page_records, page_vectors, decisions, ndocs)
+        return _SourceIngest(chunks, chunk_vectors, page_records, page_vectors, ndocs)
 
     def _check_extraction_tripwire(self, decisions: list[PageDecision], source_id: str) -> None:
         """Opt-in guard against silently broken text extraction, measured over TEXT-BEARING
@@ -499,15 +688,67 @@ def _resolve_sources(
     return valid, notes
 
 
-def _index_current(index_status: dict, discovered: list[dict], settings: Settings) -> bool:
-    if not index_status.get("ready"):
-        return False
-    stored = corpus_identity(
-        (r["source_id"], r["path"], r["size"], r["mtime_ns"])
-        for r in index_status.get("sources", [])
+def _source_identity(source: SourceMeta, settings: Settings) -> _SourceIdentity:
+    digest = hashlib.sha256()
+    with source.path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return _SourceIdentity(
+        source=source,
+        content_sha256=digest.hexdigest(),
+        text_fingerprint=text_fingerprint(settings),
+        image_fingerprint=image_fingerprint(settings, source.id),
     )
-    md = index_status.get("metadata", {})
-    return stored == discovered and md.get("fingerprint") == settings_fingerprint(settings)
+
+
+def _classify_sources(
+    identities: list[_SourceIdentity],
+    manifests: list[dict],
+    *,
+    force: bool,
+) -> dict[str, list[str]]:
+    discovered = {identity.source.id: identity for identity in identities}
+    indexed = {manifest["source_id"]: manifest for manifest in manifests}
+    removed = sorted(set(indexed) - set(discovered))
+    if force:
+        return {
+            "added": [],
+            "modified": sorted(discovered),
+            "removed": removed,
+            "unchanged": [],
+        }
+
+    added = sorted(set(discovered) - set(indexed))
+    modified: list[str] = []
+    unchanged: list[str] = []
+    for source_id in sorted(set(discovered) & set(indexed)):
+        identity = discovered[source_id]
+        manifest = indexed[source_id]
+        current = (
+            identity.content_sha256,
+            identity.text_fingerprint,
+            identity.image_fingerprint,
+        )
+        stored = (
+            manifest["content_sha256"],
+            manifest["text_fingerprint"],
+            manifest["image_fingerprint"],
+        )
+        (unchanged if current == stored else modified).append(source_id)
+    return {
+        "added": added,
+        "modified": modified,
+        "removed": removed,
+        "unchanged": unchanged,
+    }
+
+
+def _legacy_rebuild_message(version: int) -> str:
+    return (
+        f"index schema {version} is unavailable under schema v{SCHEMA_VERSION}. Stop the MCP "
+        "first, then run cci-blackbook-ingest --force once. This regenerates all embeddings "
+        "and may consume Voyage allowance or incur charges"
+    )
 
 
 def _select_lists(
