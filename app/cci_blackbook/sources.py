@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,16 +84,3 @@ def parse_unit_id(uid: str) -> tuple[str, int, str] | None:
     if (m := _IMG_LOCAL.match(local)):
         return (source_id, int(m.group(1)), "image")
     return None
-
-
-def corpus_identity(pairs: Iterable[tuple[str, str, int, int]]) -> list[dict]:
-    """Data-identity of the corpus for _index_current. `pairs` yields
-    (source_id, path, size, mtime_ns). Sorted by id → independent of filesystem order;
-    any add/remove/modify changes the returned list."""
-    return sorted(
-        (
-            {"source_id": sid, "path": str(path), "size": int(size), "mtime_ns": int(mtime_ns)}
-            for sid, path, size, mtime_ns in pairs
-        ),
-        key=lambda d: d["source_id"],
-    )

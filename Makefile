@@ -1,9 +1,10 @@
 # Local development helpers. See README.md for the full quickstart.
-.PHONY: help up down logs ingest smoke test lint
+.PHONY: help up down logs ingest ingest-force smoke test lint
 
 help:
 	@echo "make up      - build & start the MCP locally (http://127.0.0.1:8000/mcp)"
-	@echo "make ingest  - build the index from data/source/document.pdf"
+	@echo "make ingest       - incrementally refresh the index from data/source/*.pdf"
+	@echo "make ingest-force - rebuild every source (stop the MCP first for schema upgrades)"
 	@echo "make smoke   - synthetic Voyage connectivity check (needs VOYAGE_API_KEY)"
 	@echo "make test    - run the offline unit tests"
 	@echo "make lint    - ruff check"
@@ -20,7 +21,10 @@ logs:
 	docker compose logs -f | cat
 
 ingest:
-	docker compose exec cci-blackbook cci-blackbook-ingest --force
+	docker compose exec cci-blackbook cci-blackbook-ingest
+
+ingest-force:
+	docker compose run --rm cci-blackbook cci-blackbook-ingest --force
 
 smoke:
 	docker compose exec cci-blackbook cci-blackbook-ingest --smoke

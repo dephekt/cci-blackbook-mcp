@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -41,6 +42,19 @@ class PageRecord:
     reason: str
 
 
+@dataclass(frozen=True)
+class PreparedSource:
+    source: SourceMeta
+    content_sha256: str
+    text_fingerprint: str
+    image_fingerprint: str
+    indexed_at: int
+    chunks: list[Chunk]
+    chunk_vectors: list[np.ndarray]
+    page_records: list[PageRecord]
+    page_vectors: dict[tuple[str, int], np.ndarray]
+
+
 _CREATE_STATEMENTS = [
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     """CREATE TABLE IF NOT EXISTS sources (
@@ -48,7 +62,9 @@ _CREATE_STATEMENTS = [
         size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
         page_count INTEGER NOT NULL, kept_page_count INTEGER NOT NULL,
         chunk_count INTEGER NOT NULL, image_unit_count INTEGER NOT NULL,
-        ordinal INTEGER NOT NULL)""",
+        ordinal INTEGER NOT NULL, content_sha256 TEXT NOT NULL,
+        text_fingerprint TEXT NOT NULL, image_fingerprint TEXT NOT NULL,
+        indexed_at INTEGER NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS chunks (
         chunk_id TEXT PRIMARY KEY,
         source_id TEXT NOT NULL REFERENCES sources(source_id) ON DELETE CASCADE,
@@ -72,143 +88,323 @@ _CREATE_STATEMENTS = [
         PRIMARY KEY (source_id, page),
         FOREIGN KEY (source_id, page) REFERENCES pages(source_id, page) ON DELETE CASCADE)""",
 ]
-_DROP_ORDER = [  # child → parent, so FK-on drops never dangle
-    "page_embeddings", "pages", "embeddings", "chunks_fts", "chunks", "sources", "meta",
-]
-
 _SOURCE_COLS = (
     "source_id, title, path, size, mtime_ns, page_count, kept_page_count, "
     "chunk_count, image_unit_count, ordinal"
 )
+_SOURCE_MANIFEST_COLS = (
+    f"{_SOURCE_COLS}, content_sha256, text_fingerprint, image_fingerprint, indexed_at"
+)
 
 
 class BlackBookIndex:
-    def __init__(self, sqlite_path: Path):
+    def __init__(self, sqlite_path: Path, *, journal_mode: str = "WAL"):
         self.sqlite_path = sqlite_path
+        self.journal_mode = journal_mode
 
     def connect(self) -> sqlite3.Connection:
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.sqlite_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(f"PRAGMA journal_mode = {self.journal_mode}")
         return conn
 
-    def initialize(self) -> None:
-        with self.connect() as conn:
-            self._create_schema(conn)
+    def _read_connect(self) -> sqlite3.Connection:
+        uri = f"{self.sqlite_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
 
-    def rebuild(
+    def schema_version(self) -> int | None:
+        if not self.sqlite_path.exists():
+            return None
+        try:
+            with self._read_connect() as conn:
+                return int(conn.execute("PRAGMA user_version").fetchone()[0])
+        except sqlite3.DatabaseError:
+            return -1
+
+    def initialize(self) -> None:
+        version = self.schema_version()
+        if version is not None:
+            if version != int(_DB_SCHEMA):
+                raise ValueError(
+                    f"refusing to initialize legacy or unknown schema {version}"
+                )
+            return
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            self._create_schema(conn)
+            conn.execute(f"PRAGMA user_version = {int(_DB_SCHEMA)}")
+
+    def replace_sources(
         self,
         *,
-        sources: list[SourceMeta],
-        chunks: list[Chunk],
-        chunk_vectors: list[np.ndarray],
-        page_records: list[PageRecord],
-        page_vectors: dict[tuple[str, int], np.ndarray],
+        remove_source_ids: set[str],
+        prepared_sources: list[PreparedSource],
+        discovered_sources: list[SourceMeta],
         metadata: dict,
+        expected_text_dim: int,
+        expected_image_dim: int,
+        initialize: bool = False,
     ) -> None:
-        """Atomic swap across the whole corpus. Everything is validated, then the index is
-        dropped and rebuilt in ONE explicit transaction (DROP+CREATE converges an
-        old-shaped index; per-statement execute + explicit BEGIN keeps it atomic — a
-        failure rolls back to the prior index). Sets PRAGMA user_version so a physically
-        stale index is detected on the next status()."""
-        if len(chunks) != len(chunk_vectors):
-            raise ValueError("chunks and chunk_vectors length mismatch")
-        source_ids = {s.id for s in sources}
-        kept = {(pr.source_id, pr.page) for pr in page_records if pr.kept}
-        stray = set(page_vectors) - kept
-        if stray:
-            raise ValueError(f"page_vectors reference non-kept (source,page): {sorted(stray)}")
-        unknown = ({c.source_id for c in chunks} | {pr.source_id for pr in page_records}) - source_ids
-        if unknown:
-            raise ValueError(f"chunks/pages reference unknown sources: {sorted(unknown)}")
-
-        pc = Counter(pr.source_id for pr in page_records)
-        kpc = Counter(pr.source_id for pr in page_records if pr.kept)
-        cc = Counter(c.source_id for c in chunks)
-        ic = Counter(sid for (sid, _p) in page_vectors)
+        """Atomically delete and replace complete sources after all remote work is done."""
+        self._validate_replacement(
+            remove_source_ids=remove_source_ids,
+            prepared_sources=prepared_sources,
+            discovered_sources=discovered_sources,
+            expected_text_dim=expected_text_dim,
+            expected_image_dim=expected_image_dim,
+        )
 
         with self.connect() as conn:
-            conn.execute("BEGIN")  # DDL does not open an implicit txn; required for atomicity
-            self._drop_schema(conn)  # per-statement (NOT executescript, which implicit-commits)
-            self._create_schema(conn)
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if initialize:
+                tables = conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view')"
+                ).fetchone()[0]
+                if version != 0 or tables:
+                    raise ValueError("refusing to initialize a non-empty database")
+            elif version != int(_DB_SCHEMA):
+                raise ValueError(
+                    f"source replacement requires schema {_DB_SCHEMA}, found schema {version}"
+                )
+
+            conn.execute("BEGIN")
+            if initialize:
+                self._create_schema(conn)
+                conn.execute(f"PRAGMA user_version = {int(_DB_SCHEMA)}")
+
+            for source_id in sorted(remove_source_ids):
+                conn.execute(
+                    "DELETE FROM chunks_fts WHERE chunk_id IN "
+                    "(SELECT chunk_id FROM chunks WHERE source_id = ?)",
+                    (source_id,),
+                )
             conn.executemany(
-                f"INSERT INTO sources ({_SOURCE_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "DELETE FROM sources WHERE source_id = ?",
+                [(source_id,) for source_id in sorted(remove_source_ids)],
+            )
+
+            for prepared in prepared_sources:
+                self._insert_prepared(conn, prepared)
+
+            actual_ids = {
+                row[0] for row in conn.execute("SELECT source_id FROM sources").fetchall()
+            }
+            discovered_ids = {source.id for source in discovered_sources}
+            if actual_ids != discovered_ids:
+                raise ValueError(
+                    "post-replacement sources differ from discovery: "
+                    f"indexed={sorted(actual_ids)}, discovered={sorted(discovered_ids)}"
+                )
+            conn.executemany(
+                "UPDATE sources SET title=?, path=?, size=?, mtime_ns=?, ordinal=? "
+                "WHERE source_id=?",
                 [
-                    (s.id, s.title, str(s.path), s.size, s.mtime_ns,
-                     pc[s.id], kpc[s.id], cc[s.id], ic[s.id], s.ordinal)
-                    for s in sources
+                    (source.title, str(source.path), source.size, source.mtime_ns,
+                     source.ordinal, source.id)
+                    for source in discovered_sources
                 ],
             )
-            conn.executemany(
-                "INSERT INTO chunks(chunk_id,source_id,page,chunk_index,text,char_start,char_end) "
-                "VALUES (?,?,?,?,?,?,?)",
-                [
-                    (c.chunk_id, c.source_id, c.page, c.chunk_index, c.text, c.char_start, c.char_end)
-                    for c in chunks
-                ],
-            )
-            conn.executemany(
-                "INSERT INTO chunks_fts(chunk_id,page,text) VALUES (?,?,?)",
-                [(c.chunk_id, c.page, c.text) for c in chunks],
-            )
-            conn.executemany(
-                "INSERT INTO embeddings(chunk_id,dim,vector) VALUES (?,?,?)",
-                [
-                    (c.chunk_id, int(v.shape[0]), _serialize_vector(v))
-                    for c, v in zip(chunks, chunk_vectors, strict=True)
-                ],
-            )
-            conn.executemany(
-                "INSERT INTO pages(source_id,page,ocr_text,char_count,ink_coverage,color_fraction,"
-                "width,height,kept,reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (pr.source_id, pr.page, pr.ocr_text, pr.char_count, pr.ink_coverage,
-                     pr.color_fraction, pr.width, pr.height, int(pr.kept), pr.reason)
-                    for pr in page_records
-                ],
-            )
-            conn.executemany(
-                "INSERT INTO page_embeddings(source_id,page,dim,vector) VALUES (?,?,?,?)",
-                [
-                    (sid, page, int(vec.shape[0]), _serialize_vector(vec))
-                    for (sid, page), vec in sorted(page_vectors.items())
-                ],
-            )
+
+            refreshed_metadata = self._aggregate_metadata(conn, metadata)
+            conn.execute("DELETE FROM meta")
             conn.executemany(
                 "INSERT INTO meta(key,value) VALUES (?,?)",
-                [(key, json.dumps(value)) for key, value in metadata.items()],
+                [(key, json.dumps(value)) for key, value in refreshed_metadata.items()],
             )
-            conn.execute(f"PRAGMA user_version = {int(_DB_SCHEMA)}")  # transactional; rolls back on failure
+            self._validate_transaction(conn)
+
+    def _validate_replacement(
+        self,
+        *,
+        remove_source_ids: set[str],
+        prepared_sources: list[PreparedSource],
+        discovered_sources: list[SourceMeta],
+        expected_text_dim: int,
+        expected_image_dim: int,
+    ) -> None:
+        discovered_ids = [source.id for source in discovered_sources]
+        if len(discovered_ids) != len(set(discovered_ids)):
+            raise ValueError("discovered source IDs are not unique")
+        prepared_ids = [prepared.source.id for prepared in prepared_sources]
+        if len(prepared_ids) != len(set(prepared_ids)):
+            raise ValueError("prepared source IDs are not unique")
+        if set(prepared_ids) - set(discovered_ids):
+            raise ValueError("prepared sources are not present in discovery")
+        for prepared in prepared_sources:
+            source_id = prepared.source.id
+            if len(prepared.content_sha256) != 64 or any(
+                char not in "0123456789abcdef" for char in prepared.content_sha256
+            ):
+                raise ValueError(f"invalid SHA-256 for source {source_id!r}")
+            if not prepared.text_fingerprint or not prepared.image_fingerprint:
+                raise ValueError(f"missing pipeline fingerprint for source {source_id!r}")
+            if len(prepared.chunks) != len(prepared.chunk_vectors):
+                raise ValueError(f"chunk/vector count mismatch for source {source_id!r}")
+            if any(
+                chunk.source_id != source_id or not chunk.chunk_id.startswith(f"{source_id}:")
+                for chunk in prepared.chunks
+            ):
+                raise ValueError(f"chunk ownership mismatch for source {source_id!r}")
+            if any(record.source_id != source_id for record in prepared.page_records):
+                raise ValueError(f"page ownership mismatch for source {source_id!r}")
+            kept = {
+                (record.source_id, record.page)
+                for record in prepared.page_records
+                if record.kept
+            }
+            if set(prepared.page_vectors) != kept:
+                raise ValueError(
+                    f"kept-page/image-vector mismatch for source {source_id!r}"
+                )
+            _validate_vectors(
+                prepared.chunk_vectors, expected_text_dim, f"text source {source_id!r}"
+            )
+            _validate_vectors(
+                list(prepared.page_vectors.values()), expected_image_dim,
+                f"image source {source_id!r}",
+            )
+
+    def _insert_prepared(self, conn: sqlite3.Connection, prepared: PreparedSource) -> None:
+        source = prepared.source
+        conn.execute(
+            f"INSERT INTO sources ({_SOURCE_MANIFEST_COLS}) VALUES ({','.join('?' for _ in range(14))})",
+            (
+                source.id, source.title, str(source.path), source.size, source.mtime_ns,
+                len(prepared.page_records),
+                sum(1 for record in prepared.page_records if record.kept),
+                len(prepared.chunks), len(prepared.page_vectors), source.ordinal,
+                prepared.content_sha256, prepared.text_fingerprint,
+                prepared.image_fingerprint, prepared.indexed_at,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO chunks(chunk_id,source_id,page,chunk_index,text,char_start,char_end) "
+            "VALUES (?,?,?,?,?,?,?)",
+            [
+                (chunk.chunk_id, chunk.source_id, chunk.page, chunk.chunk_index,
+                 chunk.text, chunk.char_start, chunk.char_end)
+                for chunk in prepared.chunks
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO chunks_fts(chunk_id,page,text) VALUES (?,?,?)",
+            [(chunk.chunk_id, chunk.page, chunk.text) for chunk in prepared.chunks],
+        )
+        conn.executemany(
+            "INSERT INTO embeddings(chunk_id,dim,vector) VALUES (?,?,?)",
+            [
+                (chunk.chunk_id, int(vector.shape[0]), _serialize_vector(vector))
+                for chunk, vector in zip(
+                    prepared.chunks, prepared.chunk_vectors, strict=True
+                )
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO pages(source_id,page,ocr_text,char_count,ink_coverage,color_fraction,"
+            "width,height,kept,reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                (record.source_id, record.page, record.ocr_text, record.char_count,
+                 record.ink_coverage, record.color_fraction, record.width, record.height,
+                 int(record.kept), record.reason)
+                for record in prepared.page_records
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO page_embeddings(source_id,page,dim,vector) VALUES (?,?,?,?)",
+            [
+                (source_id, page, int(vector.shape[0]), _serialize_vector(vector))
+                for (source_id, page), vector in sorted(prepared.page_vectors.items())
+            ],
+        )
+
+    def _aggregate_metadata(self, conn: sqlite3.Connection, metadata: dict) -> dict:
+        result: dict[str, Any] = dict(metadata)
+        counts = {
+            "sources": conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0],
+            "chunks": conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
+            "pages": conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0],
+            "image_units": conn.execute("SELECT COUNT(*) FROM page_embeddings").fetchone()[0],
+        }
+        reasons = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT reason, COUNT(*) FROM pages GROUP BY reason ORDER BY reason"
+            ).fetchall()
+        }
+        dropped_pages = [
+            row[0]
+            for row in conn.execute(
+                "SELECT page FROM pages WHERE kept=0 ORDER BY source_id, page LIMIT 200"
+            ).fetchall()
+        ]
+        result["counts"] = counts
+        result["filter"] = {
+            "pages": counts["pages"],
+            "kept": counts["image_units"],
+            "dropped": counts["pages"] - counts["image_units"],
+            "by_reason": reasons,
+            "dropped_pages": dropped_pages,
+        }
+        return result
+
+    def _validate_transaction(self, conn: sqlite3.Connection) -> None:
+        foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if foreign_keys:
+            raise sqlite3.IntegrityError(f"foreign key violations: {foreign_keys}")
+        checks = {
+            "orphaned FTS rows": """
+                SELECT COUNT(*) FROM chunks_fts f
+                LEFT JOIN chunks c ON c.chunk_id=f.chunk_id WHERE c.chunk_id IS NULL
+            """,
+            "chunks missing FTS rows": """
+                SELECT COUNT(*) FROM chunks c
+                LEFT JOIN chunks_fts f ON f.chunk_id=c.chunk_id WHERE f.chunk_id IS NULL
+            """,
+            "kept pages missing image vectors": """
+                SELECT COUNT(*) FROM pages p LEFT JOIN page_embeddings pe
+                ON pe.source_id=p.source_id AND pe.page=p.page
+                WHERE p.kept=1 AND pe.source_id IS NULL
+            """,
+            "non-kept pages with image vectors": """
+                SELECT COUNT(*) FROM page_embeddings pe JOIN pages p
+                ON p.source_id=pe.source_id AND p.page=pe.page WHERE p.kept=0
+            """,
+        }
+        for label, sql in checks.items():
+            if conn.execute(sql).fetchone()[0]:
+                raise sqlite3.IntegrityError(label)
 
     def status(self) -> dict:
         if not self.sqlite_path.exists():
             return {"ready": False, "reason": "index database missing"}
-        with self.connect() as conn:
-            # Guard FIRST on the header int (no table dependency) — never run _create_schema
-            # or source-aware SQL against an old-shaped index (e.g. its CREATE INDEX on
-            # chunks(source_id) would fail on a pre-v3 chunks table). Only rebuild() sets
-            # user_version=SCHEMA_VERSION, and it creates the current-shape tables, so a
-            # match guarantees the queries below are safe.
-            if conn.execute("PRAGMA user_version").fetchone()[0] != int(_DB_SCHEMA):
-                return {
-                    "ready": False,
-                    "reason": "index not built or schema out of date; run cci-blackbook-ingest",
-                    "sqlite_path": str(self.sqlite_path),
+        try:
+            with self._read_connect() as conn:
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                if version != int(_DB_SCHEMA):
+                    return _schema_unavailable(version, self.sqlite_path)
+                chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                embedding_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+                page_count = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+                image_unit_count = conn.execute("SELECT COUNT(*) FROM page_embeddings").fetchone()[0]
+                indexed_image_count = conn.execute("SELECT COUNT(*) FROM pages WHERE kept = 1").fetchone()[0]
+                sources = [
+                    dict(r)
+                    for r in conn.execute(f"SELECT {_SOURCE_COLS} FROM sources ORDER BY ordinal")
+                ]
+                metadata = {
+                    row["key"]: json.loads(row["value"])
+                    for row in conn.execute("SELECT key, value FROM meta").fetchall()
                 }
-            chunk_count = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            embedding_count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
-            page_count = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-            image_unit_count = conn.execute("SELECT COUNT(*) FROM page_embeddings").fetchone()[0]
-            indexed_image_count = conn.execute("SELECT COUNT(*) FROM pages WHERE kept = 1").fetchone()[0]
-            sources = [
-                dict(r)
-                for r in conn.execute(f"SELECT {_SOURCE_COLS} FROM sources ORDER BY ordinal")
-            ]
-            metadata = {
-                row["key"]: json.loads(row["value"])
-                for row in conn.execute("SELECT key, value FROM meta").fetchall()
+        except sqlite3.DatabaseError as exc:
+            return {
+                "ready": False,
+                "reason": f"index schema is invalid or unreadable: {type(exc).__name__}",
+                "sqlite_path": str(self.sqlite_path),
             }
         return {
             "ready": chunk_count > 0 or image_unit_count > 0,
@@ -224,16 +420,48 @@ class BlackBookIndex:
         }
 
     def list_sources(self) -> list[dict]:
-        with self.connect() as conn:
-            self._create_schema(conn)
+        with self._read_connect() as conn:
             return [
                 dict(r)
                 for r in conn.execute(f"SELECT {_SOURCE_COLS} FROM sources ORDER BY ordinal")
             ]
 
+    def source_manifests(self) -> list[dict]:
+        with self._read_connect() as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] != int(_DB_SCHEMA):
+                raise ValueError("source manifests require the current schema")
+            return [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT {_SOURCE_MANIFEST_COLS} FROM sources ORDER BY ordinal"
+                )
+            ]
+
+    def validate_database(self, expected_counts: dict[str, int]) -> None:
+        with self._read_connect() as conn:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version != int(_DB_SCHEMA):
+                raise ValueError(f"expected schema {_DB_SCHEMA}, found {version}")
+            actual_counts = {
+                "sources": conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0],
+                "chunks": conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
+                "pages": conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0],
+                "image_units": conn.execute(
+                    "SELECT COUNT(*) FROM page_embeddings"
+                ).fetchone()[0],
+            }
+            if actual_counts != expected_counts:
+                raise ValueError(
+                    f"temporary index counts differ: expected={expected_counts}, "
+                    f"actual={actual_counts}"
+                )
+            self._validate_transaction(conn)
+            integrity = conn.execute("PRAGMA integrity_check").fetchall()
+            if [row[0] for row in integrity] != ["ok"]:
+                raise sqlite3.DatabaseError(f"integrity_check failed: {integrity}")
+
     def get_source(self, source_id: str) -> dict | None:
-        with self.connect() as conn:
-            self._create_schema(conn)
+        with self._read_connect() as conn:
             row = conn.execute(
                 f"SELECT {_SOURCE_COLS} FROM sources WHERE source_id = ?", (source_id,)
             ).fetchone()
@@ -242,7 +470,7 @@ class BlackBookIndex:
     def read_chunk(self, chunk_id: str) -> SearchHit | None:
         # INVARIANT (shared by all read/search methods below): callers must gate on
         # status()["ready"] first. These run source-aware SQL and call _create_schema,
-        # which would raise on a pre-v3 (old-shaped) index; status()'s user_version guard
+        # which would raise on a legacy (old-shaped) index; status()'s user_version guard
         # already returns not-ready for any such index, so we never reach here on one.
         with self.connect() as conn:
             self._create_schema(conn)
@@ -409,15 +637,55 @@ class BlackBookIndex:
         for statement in _CREATE_STATEMENTS:
             conn.execute(statement)
 
-    def _drop_schema(self, conn: sqlite3.Connection) -> None:
-        for table in _DROP_ORDER:
-            conn.execute(f"DROP TABLE IF EXISTS {table}")
-
 
 def _source_in_clause(column: str, source_ids: list[str] | None) -> tuple[str, list[str]]:
     if not source_ids:
         return "", []
     return f"{column} IN ({','.join('?' for _ in source_ids)})", list(source_ids)
+
+
+def _validate_vectors(vectors: list[np.ndarray], expected_dim: int, label: str) -> None:
+    for vector in vectors:
+        array = np.asarray(vector)
+        if array.ndim != 1 or int(array.shape[0]) != expected_dim:
+            raise ValueError(
+                f"{label} vector has shape {array.shape}, expected ({expected_dim},)"
+            )
+        if not np.isfinite(array).all():
+            raise ValueError(f"{label} vector contains non-finite values")
+
+
+def _schema_unavailable(version: int, sqlite_path: Path) -> dict:
+    return {
+        "ready": False,
+        "reason": (
+            f"index schema {version} is unavailable; stop the MCP, then run "
+            "cci-blackbook-ingest --force to rebuild schema v4. All embeddings will be "
+            "regenerated and may consume Voyage allowance or incur charges"
+        ),
+        "sqlite_path": str(sqlite_path),
+        "schema_version": version,
+    }
+
+
+def swap_database_file(*, source: Path, dest: Path) -> None:
+    """Atomically move a freshly built rollback-mode DB (`source`) onto `dest`.
+
+    `dest` is typically a legacy index created in WAL mode, so `dest-wal`/`dest-shm` may
+    hold committed-but-uncheckpointed frames (a running MCP reader or an unclean stop keeps
+    them on disk). os.replace() swaps ONLY the main file; SQLite keys WAL recovery off the
+    presence of the -wal sidecar, not the new file's header, so a surviving legacy -wal is
+    replayed onto the swapped-in file — silently resurrecting the old database (the reader
+    sees the old user_version and tables while integrity_check still returns 'ok').
+
+    Removing the sidecars BEFORE the swap is race-free: the new file never coexists with
+    them, a concurrent reader opening the doomed legacy file just sees an older valid
+    snapshot, and a crash in the two-syscall gap only discards the legacy WAL tail (leaving
+    a valid, self-contained legacy main file). `source` is built in DELETE journal mode, so
+    it carries no sidecars of its own."""
+    for suffix in ("-wal", "-shm"):
+        dest.with_name(dest.name + suffix).unlink(missing_ok=True)
+    os.replace(source, dest)
 
 
 def _serialize_vector(vector: np.ndarray) -> bytes:

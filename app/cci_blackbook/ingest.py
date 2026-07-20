@@ -10,7 +10,11 @@ from .settings import load_settings, voyage_configured
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build or refresh the CCI Black Book index.")
-    parser.add_argument("--force", action="store_true", help="rebuild even if the index is current")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild every source; stop the MCP first when replacing a legacy index",
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",
