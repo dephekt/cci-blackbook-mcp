@@ -132,28 +132,32 @@ def group_chunks_into_documents(
     chunks: list[Chunk],
     *,
     token_budget: int,
-    chars_per_token: float,
+    chunk_tokens: list[int],
     max_chunk_tokens: int,
 ) -> list[list[int]]:
     """Page-aligned greedy packing of chunk INDICES into documents <= token_budget.
 
-    A page's chunks are never split across documents (contextualization stays within a
-    page's neighborhood at minimum), every chunk lands in exactly one document, and order
-    is preserved so returned indices zip back to chunk_ids positionally. The collapse key
-    is (source_id, page) so a book's chunks are never contextualized with another book's,
-    even if this is ever handed a multi-source list. Raises if any single chunk exceeds
-    max_chunk_tokens.
+    `chunk_tokens[i]` is the REAL token count of `chunks[i]` (from the embedding model's
+    tokenizer), so a document is packed to the model's true context-window budget rather
+    than a chars/token estimate that under-counts dense content. A page's chunks are never
+    split across documents (contextualization stays within a page's neighborhood at
+    minimum), every chunk lands in exactly one document, and order is preserved so returned
+    indices zip back to chunk_ids positionally. The collapse key is (source_id, page) so a
+    book's chunks are never contextualized with another book's, even if this is ever handed
+    a multi-source list. Raises if any single chunk exceeds max_chunk_tokens.
     """
     if not chunks:
         return []
+    if len(chunk_tokens) != len(chunks):
+        raise ValueError("chunk_tokens must align 1:1 with chunks")
 
     # Collapse into per-(source, page) groups (a source's chunks arrive contiguously).
     pages: list[list] = []  # [(source_id, page), [indices], token_sum]
     for idx, chunk in enumerate(chunks):
-        tok = estimate_tokens(chunk.text, chars_per_token)
+        tok = chunk_tokens[idx]
         if tok > max_chunk_tokens:
             raise ValueError(
-                f"chunk {chunk.chunk_id} is ~{tok} tokens, exceeds max_chunk_tokens {max_chunk_tokens}"
+                f"chunk {chunk.chunk_id} is {tok} tokens, exceeds max_chunk_tokens {max_chunk_tokens}"
             )
         key = (chunk.source_id, chunk.page)
         if pages and pages[-1][0] == key:

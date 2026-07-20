@@ -7,6 +7,7 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from .chunking import estimate_tokens
 from .render import ImageUnit, page_image_tokens
 from .settings import Settings, voyage_configured
 
@@ -31,6 +32,9 @@ class DenseEmbeddingProvider(Protocol):
     def embed_text_documents(self, documents: list[list[str]]) -> list[list[np.ndarray]]:
         ...
 
+    def count_text_tokens(self, texts: list[str]) -> list[int]:
+        ...
+
     def embed_text_query(self, text: str) -> np.ndarray:
         ...
 
@@ -42,6 +46,13 @@ class DenseEmbeddingProvider(Protocol):
 
     def status(self) -> dict:
         ...
+
+
+def _is_token_overflow_error(exc: Exception) -> bool:
+    """True for Voyage's 'example too large for the context window' rejection. Manual-chunking
+    mode has no server truncation, so this is the signal to re-split. Matched on the message
+    so it needs no SDK import (and stays testable with a plain exception)."""
+    return "too many tokens" in str(exc).lower()
 
 
 def _unpack_one_document(response: Any, n: int) -> list[np.ndarray]:
@@ -123,14 +134,42 @@ class VoyageProvider:
         return self._vo  # reads VOYAGE_API_KEY from env
 
     def embed_text_documents(self, documents: list[list[str]]) -> list[list[np.ndarray]]:
-        out: list[list[np.ndarray]] = []
-        for doc in documents:  # one document per request (invariant)
-            resp = self._guard(lambda doc=doc: self._client().contextualized_embed(
+        return [self._embed_document(doc) for doc in documents]  # one document per request
+
+    def _embed_document(self, doc: list[str]) -> list[np.ndarray]:
+        """Embed one contextualized document (list of chunk strings) -> one vector per chunk.
+
+        Grouping already packs to the real token budget, but if Voyage still rejects the
+        example for exceeding its context window (e.g. a tokenizer/version skew), split the
+        document in half and embed each half separately. The halves lose cross-context — an
+        acceptable degradation for a rare oversize document — but the strict 1:1
+        chunk->vector mapping the caller depends on is preserved, and the whole (paid)
+        corpus never aborts over one document."""
+        try:
+            resp = self._client().contextualized_embed(
                 inputs=[doc], model=self.s.voyage_text_model, input_type="document",
                 output_dimension=self.s.voyage_output_dim, output_dtype=self.s.voyage_output_dtype,
-            ))
-            out.append(_unpack_one_document(resp, len(doc)))
-        return out
+            )
+            return _unpack_one_document(resp, len(doc))
+        except Exception as exc:
+            if len(doc) > 1 and _is_token_overflow_error(exc):
+                mid = len(doc) // 2
+                return self._embed_document(doc[:mid]) + self._embed_document(doc[mid:])
+            import voyageai
+            if isinstance(exc, voyageai.error.VoyageError):  # translate SDK errors loudly
+                raise VoyageUnavailable(f"{type(exc).__name__}: {exc}") from exc
+            raise
+
+    def count_text_tokens(self, texts: list[str]) -> list[int]:
+        """Real Voyage token counts (local tokenizer) so document grouping packs to the true
+        context-window limit for any content, not a chars/token estimate. Falls back to the
+        char estimate if the tokenizer is unavailable — the embed-time re-split still guards."""
+        if not texts:
+            return []
+        try:
+            return [len(t) for t in self._client().tokenize(texts, model=self.s.voyage_text_model)]
+        except Exception:
+            return [estimate_tokens(t, self.s.chars_per_token) for t in texts]
 
     def embed_text_query(self, text: str) -> np.ndarray:
         resp = self._guard(lambda: self._client().contextualized_embed(
@@ -194,6 +233,10 @@ class StubDenseProvider:
     def embed_text_documents(self, documents: list[list[str]]) -> list[list[np.ndarray]]:
         self._maybe_fail("embed_text_documents")
         return [[_hash_embed(chunk, self.dim) for chunk in doc] for doc in documents]
+
+    def count_text_tokens(self, texts: list[str]) -> list[int]:
+        # Deterministic offline estimate (no Voyage tokenizer); grouping stays exercisable.
+        return [estimate_tokens(t, 4.0) for t in texts]
 
     def embed_text_query(self, text: str) -> np.ndarray:
         self._maybe_fail("embed_text_query")
