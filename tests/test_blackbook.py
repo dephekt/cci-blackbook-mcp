@@ -546,6 +546,47 @@ class LegacyRebuildTest(unittest.TestCase):
             self.assertEqual({s["source_id"] for s in st["sources"]}, {"cci-black-book"})
             self.assertIn("fingerprint", st["metadata"])
 
+    def test_forced_rebuild_survives_stale_legacy_wal(self):
+        # Regression: legacy indexes were built in WAL mode, so an uncheckpointed -wal can
+        # sit next to the db (a live MCP reader or an unclean stop keeps it on disk). A plain
+        # os.replace of only the main file lets SQLite replay those stale frames onto the new
+        # v4 file — silently resurrecting schema v3 while PRAGMA integrity_check stays 'ok'.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            write_pdf(root / "source", "CCI Black Book.pdf")
+            sqlite_path = root / "index" / "blackbook.sqlite3"
+            sqlite_path.parent.mkdir(parents=True)
+            seed = sqlite3.connect(sqlite_path)
+            self.addCleanup(seed.close)
+            seed.execute("PRAGMA journal_mode = WAL")
+            seed.execute("PRAGMA wal_autocheckpoint = 0")  # keep the -wal uncheckpointed
+            seed.execute("PRAGMA user_version = 3")
+            seed.execute("CREATE TABLE legacy_marker(value TEXT NOT NULL)")
+            seed.execute("INSERT INTO legacy_marker VALUES ('keep-me')")
+            seed.commit()  # committed to the -wal; deliberately NOT checkpointed or closed
+            wal = sqlite_path.with_name(sqlite_path.name + "-wal")
+            self.assertTrue(wal.exists() and wal.stat().st_size > 0)
+
+            def source(_p):
+                yield rp(1, "vapor pressure deficit " * 20, ink=0.3, image=img())
+
+            svc = BlackBookService(make_settings(root), page_source=source)
+            self.assertTrue(svc.ensure_index(force=True)["rebuilt"])
+
+            # A fresh read-only open (the path the MCP uses) must see the validated v4 build,
+            # not the resurrected legacy WAL, and no stale sidecars may survive the swap.
+            self.assertEqual(svc.index.schema_version(), SCHEMA_VERSION)
+            status = svc.index.status()
+            self.assertTrue(status["ready"])
+            self.assertEqual({s["source_id"] for s in status["sources"]}, {"cci-black-book"})
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(sqlite_path.with_name(sqlite_path.name + suffix).exists())
+            with svc.index.connect() as c:
+                legacy = c.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='legacy_marker'"
+                ).fetchone()[0]
+            self.assertEqual(legacy, 0)
+
     def test_failed_temporary_validation_leaves_v3_intact(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

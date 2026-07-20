@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -665,6 +666,26 @@ def _schema_unavailable(version: int, sqlite_path: Path) -> dict:
         "sqlite_path": str(sqlite_path),
         "schema_version": version,
     }
+
+
+def swap_database_file(*, source: Path, dest: Path) -> None:
+    """Atomically move a freshly built rollback-mode DB (`source`) onto `dest`.
+
+    `dest` is typically a legacy index created in WAL mode, so `dest-wal`/`dest-shm` may
+    hold committed-but-uncheckpointed frames (a running MCP reader or an unclean stop keeps
+    them on disk). os.replace() swaps ONLY the main file; SQLite keys WAL recovery off the
+    presence of the -wal sidecar, not the new file's header, so a surviving legacy -wal is
+    replayed onto the swapped-in file — silently resurrecting the old database (the reader
+    sees the old user_version and tables while integrity_check still returns 'ok').
+
+    Removing the sidecars BEFORE the swap is race-free: the new file never coexists with
+    them, a concurrent reader opening the doomed legacy file just sees an older valid
+    snapshot, and a crash in the two-syscall gap only discards the legacy WAL tail (leaving
+    a valid, self-contained legacy main file). `source` is built in DELETE journal mode, so
+    it carries no sidecars of its own."""
+    for suffix in ("-wal", "-shm"):
+        dest.with_name(dest.name + suffix).unlink(missing_ok=True)
+    os.replace(source, dest)
 
 
 def _serialize_vector(vector: np.ndarray) -> bytes:

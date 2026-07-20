@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import statistics
 import tempfile
 import threading
@@ -27,7 +26,7 @@ from .settings import (
     voyage_configured,
 )
 from .sources import SourceMeta, discover_sources, parse_unit_id
-from .store import BlackBookIndex, PageRecord, PreparedSource, SearchHit
+from .store import BlackBookIndex, PageRecord, PreparedSource, SearchHit, swap_database_file
 
 log = logging.getLogger("cci_blackbook")
 
@@ -354,7 +353,10 @@ class BlackBookService:
                 initialize=True,
             )
             temporary_index.validate_database(expected_counts)
-            os.replace(temporary_path, self.settings.sqlite_path)
+            # Clears the legacy index's stale WAL sidecars as part of the swap; a plain
+            # os.replace would let SQLite recover them onto the new file and silently
+            # resurrect the legacy schema (see swap_database_file).
+            swap_database_file(source=temporary_path, dest=self.settings.sqlite_path)
         except Exception as exc:
             temporary_path.unlink(missing_ok=True)
             raise IngestFailed(
