@@ -429,9 +429,10 @@ class BlackBookService:
 
         chunks = chunk_pages(sid, page_texts, chunk_chars=s.chunk_chars, overlap_chars=s.chunk_overlap_chars)
         if chunks:  # per-source grouping: a book's chunks only see their own siblings
+            chunk_tokens = provider.count_text_tokens([c.text for c in chunks])  # real model tokens
             groups = group_chunks_into_documents(
                 chunks, token_budget=s.doc_token_budget,
-                chars_per_token=s.chars_per_token, max_chunk_tokens=s.max_chunk_tokens,
+                chunk_tokens=chunk_tokens, max_chunk_tokens=s.max_chunk_tokens,
             )
             documents = [[chunks[i].text for i in g] for g in groups]
             chunk_vectors = _scatter(groups, provider.embed_text_documents(documents), n=len(chunks))

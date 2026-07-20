@@ -16,7 +16,6 @@ from cci_blackbook.auth import is_authorized
 from cci_blackbook.chunking import (
     Chunk,
     chunk_page,
-    estimate_tokens,
     group_chunks_into_documents,
 )
 from cci_blackbook.embeddings import (
@@ -224,10 +223,11 @@ class GroupingTest(unittest.TestCase):
 
     def test_page_aligned_within_budget_every_chunk_once(self):
         chunks = self._chunks([(1, 2), (2, 3), (3, 1)])
-        per_chunk = estimate_tokens("word " * 30, 3.0)
+        per_chunk = 40
+        chunk_tokens = [per_chunk] * len(chunks)
         budget = per_chunk * 4
         groups = group_chunks_into_documents(
-            chunks, token_budget=budget, chars_per_token=3.0, max_chunk_tokens=32000
+            chunks, token_budget=budget, chunk_tokens=chunk_tokens, max_chunk_tokens=32000
         )
         flat = [i for g in groups for i in g]
         self.assertEqual(sorted(flat), list(range(len(chunks))))
@@ -238,16 +238,28 @@ class GroupingTest(unittest.TestCase):
         self.assertTrue(all(len(v) == 1 for v in page_to_docs.values()))
         self.assertEqual(len(groups), 2)  # budget MUST split
         for g in groups:
-            doc_tokens = sum(estimate_tokens(chunks[i].text, 3.0) for i in g)
-            self.assertLessEqual(doc_tokens, budget)
+            self.assertLessEqual(sum(chunk_tokens[i] for i in g), budget)
+
+    def test_packs_by_real_tokens_not_char_length(self):
+        # Same chunks (identical text/char length), two pages. Grouping must use the supplied
+        # REAL token counts, not len(text): with 30-token pages a budget of 40 splits them,
+        # with 15-token pages the same budget packs both into one document.
+        chunks = self._chunks([(1, 1), (2, 1)])
+        expensive = group_chunks_into_documents(
+            chunks, token_budget=40, chunk_tokens=[30, 30], max_chunk_tokens=32000
+        )
+        self.assertEqual(len(expensive), 2)
+        cheap = group_chunks_into_documents(
+            chunks, token_budget=40, chunk_tokens=[15, 15], max_chunk_tokens=32000
+        )
+        self.assertEqual(len(cheap), 1)
 
     def test_documents_never_mix_sources(self):
         # Two books whose chunks together fit under budget must STILL be split by source,
         # so one book is never contextualized with another.
         chunks = self._chunks([(1, 1)], sid="book-a") + self._chunks([(1, 1)], sid="book-b")
-        big = estimate_tokens("word " * 30, 3.0) * 100  # far above the total
         groups = group_chunks_into_documents(
-            chunks, token_budget=big, chars_per_token=3.0, max_chunk_tokens=32000
+            chunks, token_budget=10000, chunk_tokens=[10, 10], max_chunk_tokens=32000
         )
         self.assertEqual(len(groups), 2)  # split by source despite ample budget for both
         for g in groups:
@@ -257,14 +269,62 @@ class GroupingTest(unittest.TestCase):
         chunks = self._chunks([(1, 1)])
         with self.assertRaises(ValueError):
             group_chunks_into_documents(
-                chunks, token_budget=100000, chars_per_token=3.0, max_chunk_tokens=1
+                chunks, token_budget=100000, chunk_tokens=[2], max_chunk_tokens=1
+            )
+
+    def test_misaligned_chunk_tokens_raises(self):
+        chunks = self._chunks([(1, 2)])
+        with self.assertRaises(ValueError):
+            group_chunks_into_documents(
+                chunks, token_budget=100, chunk_tokens=[10], max_chunk_tokens=1000
             )
 
     def test_empty(self):
         self.assertEqual(
-            group_chunks_into_documents([], token_budget=100, chars_per_token=3.0, max_chunk_tokens=10),
+            group_chunks_into_documents([], token_budget=100, chunk_tokens=[], max_chunk_tokens=10),
             [],
         )
+
+
+class TokenCountTest(unittest.TestCase):
+    def test_stub_counts_are_positive_and_length_aligned(self):
+        counts = StubDenseProvider(dim=8).count_text_tokens(["", "a few words", "x" * 400])
+        self.assertEqual(len(counts), 3)
+        self.assertTrue(all(c >= 1 for c in counts))
+        self.assertGreater(counts[2], counts[1])  # longer text -> more tokens
+
+
+class ReSplitTest(unittest.TestCase):
+    def test_embed_document_resplits_on_token_overflow(self):
+        # A document Voyage rejects for exceeding the 32000-token window must be split and
+        # retried, preserving the strict one-vector-per-chunk contract instead of aborting.
+        from cci_blackbook.embeddings import VoyageProvider
+
+        settings = make_settings(Path("/tmp/resplit"))  # voyage_* fields only; path unused
+        prov = VoyageProvider(settings)
+        calls = []
+
+        class FakeClient:
+            def contextualized_embed(self, *, inputs, model, input_type,
+                                     output_dimension, output_dtype):
+                doc = inputs[0]
+                calls.append(len(doc))
+                if len(doc) > 2:  # oversize example -> Voyage rejects (no manual-mode truncation)
+                    raise RuntimeError(
+                        "The example at index 0 in your batch has too many tokens and does "
+                        "not fit into the model's context window of 32000 tokens."
+                    )
+                embs = [[float(i)] * output_dimension for i in range(len(doc))]
+                return SimpleNamespace(results=[SimpleNamespace(embeddings=embs)])
+
+        prov._vo = FakeClient()  # bypass the lazy voyageai import
+        vecs = prov.embed_text_documents([["a", "b", "c", "d"]])
+        self.assertEqual(len(vecs), 1)
+        self.assertEqual(len(vecs[0]), 4)  # 4 chunks -> 4 vectors despite the split
+        self.assertTrue(all(v.shape == (settings.voyage_output_dim,) for v in vecs[0]))
+        self.assertEqual(calls[0], 4)  # tried the whole doc first...
+        self.assertTrue(all(c <= 2 for c in calls[1:]))  # ...then embedded <=2-chunk halves
+        self.assertNotIn("voyageai", sys.modules)  # overflow path never imports the SDK
 
 
 class BatchingTest(unittest.TestCase):
@@ -1519,6 +1579,9 @@ class FingerprintTest(unittest.TestCase):
                 {"mm_token_budget": 10},
                 {"mm_max_inputs": 1},
                 {"min_expected_median_chars": ScopedInt.all(200)},
+                # chars_per_token only sizes multimodal request batches now (grouping uses
+                # real tokens), so it must invalidate neither embedding space.
+                {"chars_per_token": 2.0},
             ):
                 changed = replace(base, **change)
                 self.assertEqual(base_text, text_fingerprint(changed))

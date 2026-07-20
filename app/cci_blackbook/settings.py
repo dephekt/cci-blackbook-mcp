@@ -259,12 +259,17 @@ def text_fingerprint(s: Settings) -> str:
         "output": {"dimension": s.voyage_output_dim, "dtype": s.voyage_output_dtype},
         "chunking": {"chars": s.chunk_chars, "overlap_chars": s.chunk_overlap_chars},
         "contextual_grouping": {
-            "revision": 1,
+            # revision 2: grouping packs to REAL model token counts (not a chars/token
+            # estimate), so document_token_budget is now a true-token budget. Bumping this
+            # invalidates estimate-grouped indexes so they re-embed cleanly.
+            "revision": 2,
             "page_aligned": True,
             "document_token_budget": s.doc_token_budget,
         },
+        # chars_per_token is intentionally absent: it now only sizes multimodal request
+        # batches (page_image_tokens), which never changes an embedding vector, so it must
+        # not invalidate the text index.
         "token_settings": {
-            "chars_per_token": s.chars_per_token,
             "max_chunk_tokens": s.max_chunk_tokens,
         },
     })
